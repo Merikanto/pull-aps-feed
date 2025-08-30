@@ -14,5 +14,5 @@ pip install poetry
 poetry install
 
 # run script
-poetry run python physics-journals-feed.py
+poetry run python physics-journals-feed.py 
 ```
