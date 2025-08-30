@@ -1,15 +1,18 @@
-# pull-aps-feed
+# Pull APS Feed
 
 Pull feed from https://journals.aps.org/feeds
 
-`<br>`
+<br>
 
-Usage Guide
+## Usage Guide
 
-```
-sh
+```sh
 # install poetry
 pip install poetry
 
-# 
+# install deps via poetry
+poetry install
+
+# run script
+poetry run python physics-journals-feed.py
 ```
