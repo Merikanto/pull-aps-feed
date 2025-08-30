@@ -7,7 +7,6 @@ extracts relevant information, and outputs it to both structured YAML and
 formatted Markdown files.
 
 Usage:
-    cd scripts/x-sci
     poetry run python physics-journals-feed.py
 
 TODO:
