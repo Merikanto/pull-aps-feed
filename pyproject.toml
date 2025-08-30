@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "all-python"
+version = "0.1.0"
+description = ""
+authors = ["KK <ks.merikanto@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+numpy = "^2.3.2"
+pandas = "^2.3.1"
+matplotlib = "^3.10.5"
+scipy = "^1.16.1"
+feedparser = "^6.0.10"
+requests = "^2.32.5"
+beautifulsoup4 = "^4.13.5"
+pyyaml = "^6.0"
+asyncio = "^4.0.0"
+flask = "^3.1.2"
+html-to-json = "^2.0.0"
+mattermostdriver = "^7.3.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
