@@ -316,7 +316,7 @@ class PRLFeedProcessor:
         
         return ""
     
-    def process_entry(self, entry: Dict[str, Any], filter_keywords: List[str]) -> Optional[FeedEntry]:
+    def process_entry(self, entry: Dict[str, Any], keyword_groups: Dict[str, List[str]]) -> Optional[FeedEntry]:
         """Process a single feed entry into a FeedEntry object."""
         try:
             title = entry.get("title", "").strip()
@@ -333,7 +333,7 @@ class PRLFeedProcessor:
             )
             
             # Check for keyword matches
-            keywords = check_keywords(title, summary, filter_keywords)
+            keywords = check_keywords(title, summary, keyword_groups)
             
             return FeedEntry(
                 title=title,
@@ -350,7 +350,7 @@ class PRLFeedProcessor:
             logger.warning(f"Failed to process entry '{entry.get('title', 'Unknown')}': {e}")
             return None
     
-    def process_feed(self, filter_keywords: List[str]) -> List[FeedEntry]:
+    def process_feed(self, keyword_groups: Dict[str, List[str]]) -> List[FeedEntry]:
         """Process entire feed and return list of FeedEntry objects."""
         raw_entries = self.fetch_entries()
         processed_entries = []
@@ -358,7 +358,7 @@ class PRLFeedProcessor:
         logger.info(f"📌 📌 Processing {len(raw_entries)} entries")
         
         for raw_entry in raw_entries:
-            processed_entry = self.process_entry(raw_entry, filter_keywords)
+            processed_entry = self.process_entry(raw_entry, keyword_groups)
             if processed_entry:
                 processed_entries.append(processed_entry)
         
@@ -626,7 +626,7 @@ def write_yaml_file(entries: List[FeedEntry], output_path: Path) -> None:
         raise
 
 
-def write_markdown_file(entries: List[FeedEntry], output_path: Path, filter_keywords: List[str], feeds: List[Dict[str, str]], feed_order: Dict[str, int]) -> None:
+def write_markdown_file(entries: List[FeedEntry], output_path: Path, keyword_groups: Dict[str, List[str]], feeds: List[Dict[str, str]], feed_order: Dict[str, int]) -> None:
     """Write entries to Markdown file with table format."""
     try:
         with output_path.open('w', encoding='utf-8') as f:
@@ -641,8 +641,17 @@ def write_markdown_file(entries: List[FeedEntry], output_path: Path, filter_keyw
                 f.write(f"-   [{feed['description']}]({feed['url']})\n")
             
             f.write(f"\n\n\n>   Note: Each article with  🔖 means that it can be found on Arxiv.\n")
-            f.write(f">   Matched keywords are ==highlighted== in titles and summaries.\n")
-            f.write(f">   Only articles matching keywords: [=={', '.join(filter_keywords)}==] are included.\n\n")
+            f.write(f">   Matched keywords are ==highlighted== in titles and summaries.\n\n\n")
+            
+            # Format keyword groups for display
+            group_display = []
+            for group_name, keywords in keyword_groups.items():
+                group_display.append(f"{group_name} - {', '.join(keywords)}")
+            
+            f.write(f">   Articles must match ALL keywords in at least one group:\n")
+            for group_desc in group_display:
+                f.write(f">   - {group_desc}\n")
+            f.write(f"\n")
             
             # Group entries by source feed
             grouped_entries = defaultdict(list)
@@ -674,12 +683,16 @@ def load_config() -> Dict[str, Any]:
             logger.warning(f"Input file {INPUT_FILE} not found. Creating default file.")
             # Create default config file
             default_config = {
-                "Keywords": [
-                    "Symmetry",
-                    "Hermitian", 
-                    "Bose-Einstein",
-                    "BEC"
-                ],
+                "Keywords": {
+                    "Group 1": [
+                        "Hermitian",
+                        "Bose-Einstein"
+                    ],
+                    "Group 2": [
+                        "Symmetry", 
+                        "BEC"
+                    ]
+                },
                 "Feed-URL": {
                     "Recently published in Reviews of Modern Physics": [
                         "https://feeds.aps.org/rss/recent/rmp.xml"
@@ -705,8 +718,20 @@ def load_config() -> Dict[str, Any]:
         
         with INPUT_FILE.open('r', encoding='utf-8') as f:
             data = yaml.safe_load(f)
-            keywords = data.get("Keywords", [])
+            keywords_data = data.get("Keywords", {})
             feed_url_data = data.get("Feed-URL", {})
+            
+            # Handle both old flat list format and new group format for backwards compatibility
+            if isinstance(keywords_data, list):
+                # Old format: convert to single group
+                keyword_groups = {"Default Group": keywords_data}
+                logger.info(f"Loaded {len(keywords_data)} keywords in legacy format from {INPUT_FILE}")
+            else:
+                # New format: use groups as-is
+                keyword_groups = keywords_data
+                total_keywords = sum(len(group) for group in keyword_groups.values())
+                group_summary = ", ".join([f"{name}({len(group)} keywords)" for name, group in keyword_groups.items()])
+                logger.info(f"Loaded {total_keywords} keywords in {len(keyword_groups)} groups from {INPUT_FILE}: {group_summary}")
             
             # Convert Feed-URL structure to list of feed info
             feed_info = []
@@ -718,26 +743,29 @@ def load_config() -> Dict[str, Any]:
                     # Handle single URL case
                     feed_info.append({"description": description, "url": urls})
             
-            logger.info(f"Loaded {len(keywords)} keywords from {INPUT_FILE}: {', '.join(keywords)}")
             logger.info(f"Loaded {len(feed_info)} feeds from {INPUT_FILE}")
             
             return {
-                "keywords": keywords,
+                "keywords": keyword_groups,
                 "feeds": feed_info
             }
     
     except Exception as e:
         logger.error(f"Error loading config from {INPUT_FILE}: {e}")
         # Return default config on error
-        default_keywords = ["Symmetry", "Hermitian", "Bose-Einstein", "BEC"]
+        default_keyword_groups = {
+            "Group 1": ["Hermitian", "Bose-Einstein"],
+            "Group 2": ["Symmetry", "BEC"]
+        }
         default_feeds = [
             {"description": "Recently published in Reviews of Modern Physics", "url": "https://feeds.aps.org/rss/recent/rmp.xml"},
             {"description": "PRL - Recently published", "url": "https://feeds.aps.org/rss/recent/prl.xml"}
         ]
-        logger.info(f"Using default keywords: {', '.join(default_keywords)}")
+        total_keywords = sum(len(group) for group in default_keyword_groups.values())
+        logger.info(f"Using default keyword groups: {total_keywords} keywords in {len(default_keyword_groups)} groups")
         logger.info(f"Using default feeds: {len(default_feeds)} feeds")
         return {
-            "keywords": default_keywords,
+            "keywords": default_keyword_groups,
             "feeds": default_feeds
         }
 
@@ -775,14 +803,28 @@ def highlight_keywords(text: str, keywords: List[str]) -> str:
     return highlighted_text
 
 
-def check_keywords(title: str, summary: str, filter_keywords: List[str]) -> List[str]:
-    """Check if title or summary contains any of the filter keywords (case-insensitive)."""
+def check_keywords(title: str, summary: str, keyword_groups: Dict[str, List[str]]) -> List[str]:
+    """Check if title or summary contains all keywords from any group (case-insensitive)."""
     matched_keywords = []
     text_to_search = f"{title} {summary}".lower()
     
-    for keyword in filter_keywords:
-        if keyword.lower() in text_to_search:
-            matched_keywords.append(keyword)
+    for group_name, keywords in keyword_groups.items():
+        # Check if ALL keywords in this group are present
+        group_matches = []
+        all_keywords_found = True
+        
+        for keyword in keywords:
+            if keyword.lower() in text_to_search:
+                group_matches.append(keyword)
+            else:
+                all_keywords_found = False
+                break
+        
+        # If all keywords in this group were found, add them to matched_keywords
+        if all_keywords_found and group_matches:
+            matched_keywords.extend(group_matches)
+            # You could break here if you only want the first matching group,
+            # but we'll continue to allow multiple groups to match
     
     return matched_keywords
 
@@ -838,7 +880,7 @@ def remove_duplicates_by_title(entries: List[FeedEntry]) -> List[FeedEntry]:
     return deduplicated_entries
 
 
-def process_single_feed(feed_info: Dict[str, str], filter_keywords: List[str]) -> List[FeedEntry]:
+def process_single_feed(feed_info: Dict[str, str], keyword_groups: Dict[str, List[str]]) -> List[FeedEntry]:
     """Process a single feed and return entries."""
     feed_url = feed_info["url"]
     feed_description = feed_info["description"]
@@ -846,7 +888,7 @@ def process_single_feed(feed_info: Dict[str, str], filter_keywords: List[str]) -
     try:
         logger.info(f"Processing feed: {feed_description} ({feed_url})")
         processor = PRLFeedProcessor(feed_url, feed_description)
-        entries = processor.process_feed(filter_keywords)
+        entries = processor.process_feed(keyword_groups)
         logger.info(f"Added {len(entries)} entries from {feed_description}")
         return entries
     except Exception as e:
@@ -932,7 +974,7 @@ def main() -> None:
         
         # Load config from YAML file
         config = load_config()
-        filter_keywords = config["keywords"]
+        keyword_groups = config["keywords"]
         feeds = config["feeds"]
         
         # Process all feeds in parallel
@@ -947,7 +989,7 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all feed processing tasks
             future_to_feed = {
-                executor.submit(process_single_feed, feed, filter_keywords): feed
+                executor.submit(process_single_feed, feed, keyword_groups): feed
                 for feed in feeds
             }
             
@@ -992,7 +1034,7 @@ def main() -> None:
         
         # Write to both YAML and Markdown files
         write_yaml_file(enriched_entries, OUTPUT_YAML_FILE)  # All entries
-        write_markdown_file(deduplicated_entries, OUTPUT_MARKDOWN_FILE, filter_keywords, feeds, feed_order)  # Keyword matches, deduplicated
+        write_markdown_file(deduplicated_entries, OUTPUT_MARKDOWN_FILE, keyword_groups, feeds, feed_order)  # Keyword matches, deduplicated
         
         # Report results
         arxiv_matches = sum(1 for entry in enriched_entries if entry.arxiv)
@@ -1004,7 +1046,13 @@ def main() -> None:
         print(f"  - YAML output: {OUTPUT_YAML_FILE} ({len(enriched_entries)} articles)")
         print(f"  - Markdown output: {OUTPUT_MARKDOWN_FILE} ({final_articles} articles after deduplication)")
         print(f"Found {arxiv_matches} arXiv matches out of {len(enriched_entries)} articles")
-        print(f"Found {keyword_matches} articles matching keywords: {', '.join(filter_keywords)}")
+        
+        # Format keyword groups for display
+        group_summary = []
+        for group_name, keywords in keyword_groups.items():
+            group_summary.append(f"{group_name}=[{', '.join(keywords)}]")
+        
+        print(f"Found {keyword_matches} articles matching keyword groups: {' OR '.join(group_summary)}")
         if duplicates_removed > 0:
             print(f"Removed {duplicates_removed} duplicate articles from markdown output")
         

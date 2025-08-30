@@ -1,9 +1,20 @@
-# For Article filtering
+# Matching is done by groups of keywords
 Keywords:
-  - Symmetry
-  - Hermitian
-  - Bose-Einstein
-  - BEC
+  Group 1:
+    - Bose-Einstein
+    - Gross-Pitaevskii
+  Group 2:
+    - Bose-Einstein
+    - Fifth force
+  Group 3:
+    - Bose-Einstein
+    - Symmetry
+  Group 4:
+    - Bose-Einstein
+    - Dark matter
+  Group 5:
+    - Bose-Einstein
+    - Effective field theory
 
 
 # From APS RSS Feeds: https://journals.aps.org/feeds
