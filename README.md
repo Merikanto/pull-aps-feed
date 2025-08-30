@@ -10,7 +10,7 @@ Pull feed from https://journals.aps.org/feeds
 # install poetry
 pip install poetry
 
-# install deps via poetry
+# install deps via poetry (Run this in project root folder)
 poetry install
 
 # run script
