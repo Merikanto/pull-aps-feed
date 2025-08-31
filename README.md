@@ -31,9 +31,8 @@ aps_feed/
 ├── output.py            # YAML and Markdown output generation
 └── main.py              # Main orchestration logic
 
-aps-feed.py  # Simple runner script
-requirements.txt         # Python dependencies
-aps-feed-input.yml  # Configuration file (create this)
+aps-feed.py  		 # Simple runner script
+aps-feed-input.yml  	 # Configuration file (create this)
 ```
 
 <br>
