@@ -1,2 +1,4 @@
 .vscode
-*aps*
+*aps_results.yml
+aps*.md
+*__pycache*
