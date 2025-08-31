@@ -20,7 +20,7 @@ from urllib3.util.retry import Retry
 
 # File paths
 INPUT_FILE = Path("aps-feed-input.yml")  # YAML config with keyword groups and feed URLs
-OUTPUT_YAML_FILE = Path("physics_journals_feed/aps_results.yml")       # All processed articles (YAML format)
+OUTPUT_YAML_FILE = Path("aps_feed/aps_results.yml")       # All processed articles (YAML format)
 
 # Network request settings
 REQUEST_TIMEOUT = 15          # HTTP request timeout in seconds (reduced for faster failure)

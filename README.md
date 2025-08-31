@@ -22,7 +22,7 @@ poetry run python aps-feed.py
 ## 📁 Project Structure
 
 ```
-physics_journals_feed/
+aps_feed/
 ├── __init__.py          # Package initialization and main imports
 ├── config.py            # Configuration constants and YAML loading
 ├── models.py            # Data models (FeedEntry class)
@@ -91,10 +91,10 @@ Feed-URL:
 poetry run python aps-feed.py
 
 # Method 2: Running as a module
-python -m physics_journals_feed.main
+python -m aps_feed.main
 
 # Method 3: Direct import and run
-python -c "from physics_journals_feed import main; main()"
+python -c "from aps_feed import main; main()"
 ```
 
 <br>
@@ -118,7 +118,7 @@ python -c "from physics_journals_feed import main; main()"
 
 ### Network Settings
 
-Edit `physics_journals_feed/config.py`:
+Edit `aps_feed/config.py`:
 
 ```python
 REQUEST_TIMEOUT = 15          # HTTP timeout in seconds

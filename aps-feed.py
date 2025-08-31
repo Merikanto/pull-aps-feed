@@ -9,7 +9,7 @@ Usage:
     poetry run python aps-feed.py
 """
 
-from physics_journals_feed import main
+from aps_feed import main
 
 if __name__ == "__main__":
     main() 
