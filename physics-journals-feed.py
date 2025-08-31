@@ -43,6 +43,8 @@ import feedparser
 import requests
 import yaml
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # =============================================================================
 # CONFIGURATION CONSTANTS
@@ -53,8 +55,13 @@ INPUT_FILE = Path("physics-journals-input.yml")  # YAML config with keyword grou
 OUTPUT_YAML_FILE = Path("aps_results.yml")       # All processed articles (YAML format)
 
 # Network request settings
-REQUEST_TIMEOUT = 30          # HTTP request timeout in seconds
+REQUEST_TIMEOUT = 15          # HTTP request timeout in seconds (reduced for faster failure)
 MAX_ARXIV_RESULTS = 20        # Maximum number of arXiv search results to process
+
+# Parallelism optimization
+MAX_FEED_WORKERS = 20         # Maximum parallel workers for RSS feed processing
+MAX_ARXIV_WORKERS = 15        # Maximum parallel workers for arXiv enrichment
+ARXIV_BATCH_SIZE = 50         # Process arXiv in batches to optimize memory/performance
 
 # Article matching thresholds
 TITLE_SIMILARITY_THRESHOLD = 0.9  # Minimum title similarity for arXiv matching (0.0-1.0)
@@ -72,6 +79,61 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# OPTIMIZED SESSION MANAGEMENT
+# =============================================================================
+
+def create_optimized_session() -> requests.Session:
+    """
+    Create an optimized requests session with connection pooling and retry logic.
+    
+    This session is optimized for concurrent requests with automatic retries
+    and connection pooling to improve performance.
+    
+    Returns:
+        Configured requests.Session with optimizations
+    """
+    session = requests.Session()
+    
+    # Configure retry strategy for transient failures
+    retry_strategy = Retry(
+        total=3,                    # Total number of retries
+        status_forcelist=[429, 500, 502, 503, 504],  # HTTP status codes to retry
+        backoff_factor=0.5,         # Backoff factor between retries
+        respect_retry_after_header=True  # Respect server retry-after headers
+    )
+    
+    # Configure HTTP adapter with connection pooling
+    adapter = HTTPAdapter(
+        pool_connections=50,        # Number of connection pools
+        pool_maxsize=50,           # Maximum number of connections per pool
+        max_retries=retry_strategy,
+        pool_block=False           # Don't block when pool is full
+    )
+    
+    # Mount adapter for both HTTP and HTTPS
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    # Set default headers for better performance
+    session.headers.update({
+        'User-Agent': 'APS-Feed-Processor/1.0 (Scientific Research Tool)',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive'
+    })
+    
+    return session
+
+# Global session instance for reuse across requests
+_global_session = None
+
+def get_session() -> requests.Session:
+    """Get or create the global optimized session."""
+    global _global_session
+    if _global_session is None:
+        _global_session = create_optimized_session()
+    return _global_session
 
 
 class FeedEntry:
@@ -602,7 +664,9 @@ class ArxivMatcher:
             url = f"{self.base_url}?" + urllib.parse.urlencode(params)
             logger.debug(f"Searching arXiv with keywords: '{search_query}'")
             
-            response = requests.get(url, timeout=REQUEST_TIMEOUT)
+            # Use optimized session for better performance
+            session = get_session()
+            response = session.get(url, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             
             parsed = feedparser.parse(response.text)
@@ -1210,11 +1274,11 @@ def enrich_single_entry_with_arxiv(entry: FeedEntry) -> FeedEntry:
 
 def enrich_with_arxiv(entries: List[FeedEntry]) -> List[FeedEntry]:
     """
-    Enrich article entries with arXiv data using parallel processing.
+    Enrich article entries with arXiv data using optimized parallel processing.
     
     This function searches arXiv for matching articles and enriches the entries
     with arXiv summaries and links when matches are found. Processing is done
-    in parallel to optimize performance while respecting API rate limits.
+    in parallel with batch optimization for better performance while respecting API limits.
     
     Args:
         entries: List of FeedEntry objects to enrich
@@ -1223,43 +1287,56 @@ def enrich_with_arxiv(entries: List[FeedEntry]) -> List[FeedEntry]:
         List of enriched FeedEntry objects (same order as input)
         
     Note:
-        Uses ThreadPoolExecutor with limited workers to avoid overwhelming arXiv API.
+        Uses optimized ThreadPoolExecutor with batch processing and connection pooling.
         Failed enrichments gracefully fall back to original entry data.
     """
     if not entries:
         logger.debug("No entries provided for arXiv enrichment")
         return []
     
-    logger.info(f"🔍 Starting arXiv enrichment for {len(entries)} articles...")
+    logger.info(f"🔍 Starting optimized arXiv enrichment for {len(entries)} articles...")
+    
+    # Process in batches for memory efficiency and better performance
     enriched_entries = []
+    total_batches = (len(entries) + ARXIV_BATCH_SIZE - 1) // ARXIV_BATCH_SIZE
     
-    # Use ThreadPoolExecutor for parallel arXiv processing
-    max_workers = min(len(entries), 5)  # Limit concurrent requests to respect arXiv API
-    logger.info(f"⚡ Using {max_workers} parallel workers for arXiv enrichment")
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all enrichment tasks
-        future_to_entry = {
-            executor.submit(enrich_single_entry_with_arxiv, entry): entry
-            for entry in entries
-        }
+    for batch_num, i in enumerate(range(0, len(entries), ARXIV_BATCH_SIZE), 1):
+        batch_entries = entries[i:i + ARXIV_BATCH_SIZE]
+        batch_start_time = time.time()
+        logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch_entries)} articles)")
         
-        # Collect results as they complete
-        for future in as_completed(future_to_entry):
-            entry = future_to_entry[future]
-            try:
-                enriched_entry = future.result()
-                enriched_entries.append(enriched_entry)
-            except Exception as e:
-                logger.error(f"Entry '{entry.title}' generated an exception: {e}")
-                # Add the original entry if enrichment fails
-                enriched_entries.append(entry)
+        # Use ThreadPoolExecutor for parallel arXiv processing within batch
+        max_workers = min(len(batch_entries), MAX_ARXIV_WORKERS)
+        logger.debug(f"⚡ Using {max_workers} parallel workers for batch {batch_num}")
+        
+        batch_enriched = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all enrichment tasks for this batch
+            future_to_entry = {
+                executor.submit(enrich_single_entry_with_arxiv, entry): entry
+                for entry in batch_entries
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_entry):
+                entry = future_to_entry[future]
+                try:
+                    enriched_entry = future.result()
+                    batch_enriched.append(enriched_entry)
+                except Exception as e:
+                    logger.error(f"Entry '{entry.title[:60]}...' generated an exception: {e}")
+                    # Add the original entry if enrichment fails
+                    batch_enriched.append(entry)
+        
+        # Sort batch to maintain original order within the batch
+        title_to_index = {entry.title: idx for idx, entry in enumerate(batch_entries)}
+        batch_enriched.sort(key=lambda x: title_to_index.get(x.title, 999))
+        
+        enriched_entries.extend(batch_enriched)
+        batch_time = time.time() - batch_start_time
+        logger.info(f"✅ Completed batch {batch_num}/{total_batches} in {batch_time:.1f}s")
     
-    # Sort to maintain original order (since parallel processing can change order)
-    # Create a mapping of title to original index for sorting
-    title_to_index = {entry.title: i for i, entry in enumerate(entries)}
-    enriched_entries.sort(key=lambda x: title_to_index.get(x.title, 999))
-    
+    logger.info(f"🎉 Completed arXiv enrichment for all {len(enriched_entries)} articles")
     return enriched_entries
 
 
@@ -1304,7 +1381,7 @@ def main() -> None:
         feed_order = {feed['description']: i for i, feed in enumerate(feeds)}
         
         # Use ThreadPoolExecutor for parallel RSS feed processing
-        max_workers = min(len(feeds), 10)  # Limit concurrent connections to avoid overwhelming servers
+        max_workers = min(len(feeds), MAX_FEED_WORKERS)  # Optimize concurrent connections
         logger.info(f"⚡ Using {max_workers} parallel workers for feed processing")
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1317,23 +1394,30 @@ def main() -> None:
             # Collect results as they complete, maintaining feed association
             feed_results = {}
             completed_feeds = 0
+            collected_entries = []  # Start collecting entries early for pipeline processing
+            
             for future in as_completed(future_to_feed):
                 feed = future_to_feed[future]
                 completed_feeds += 1
                 try:
                     entries = future.result()
                     feed_results[feed['description']] = entries
+                    collected_entries.extend(entries)  # Add to early collection
                     logger.info(f"📦 Feed {completed_feeds}/{len(feeds)} completed: {feed['description']} ({len(entries)} entries)")
                 except Exception as e:
                     logger.error(f"❌ Feed {feed['description']} failed: {e}")
                     feed_results[feed['description']] = []
         
-        # Combine all entries in the original feed order
-        all_entries = []
-        for feed in feeds:
-            feed_desc = feed['description']
-            if feed_desc in feed_results:
-                all_entries.extend(feed_results[feed_desc])
+        # Use collected entries (already in completion order) or fallback to ordered collection
+        if collected_entries:
+            all_entries = collected_entries
+        else:
+            # Fallback: combine entries in original feed order (if needed)
+            all_entries = []
+            for feed in feeds:
+                feed_desc = feed['description']
+                if feed_desc in feed_results:
+                    all_entries.extend(feed_results[feed_desc])
         
         # Check if any entries were found across all feeds
         if not all_entries:
