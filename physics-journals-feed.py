@@ -32,7 +32,6 @@ from bs4 import BeautifulSoup
 # Configuration
 INPUT_FILE = Path("physics-journals-input.yml")
 OUTPUT_YAML_FILE = Path("aps_results.yml")
-OUTPUT_MARKDOWN_FILE = Path("aps_results.md")
 
 # Request timeout and retry settings
 REQUEST_TIMEOUT = 30
@@ -632,7 +631,7 @@ def write_markdown_file(entries: List[FeedEntry], output_path: Path, keyword_gro
         with output_path.open('w', encoding='utf-8') as f:
             # Write header
             f.write("# Physics Journals - Recent Articles\n\n")
-            f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d')}\n\n")
+            f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
             f.write(f"Total articles: {len(entries)} (from {len(feeds)} feeds)\n\n")
             
             # Write feed sources
@@ -971,6 +970,10 @@ def main() -> None:
     """Main function."""
     try:
         start_time = time.time()
+        
+        # Generate timestamped markdown filename
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+        OUTPUT_MARKDOWN_FILE = Path(f"Results/aps_{timestamp}.md")
         
         # Load config from YAML file
         config = load_config()
