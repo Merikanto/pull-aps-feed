@@ -18,7 +18,7 @@ Input:
 
 Output:
     aps_results.yml: All processed articles in YAML format
-    Results/APS_YYYYMMDD_HHMM.md: Filtered and enriched articles in Markdown format
+    Results/Aps_YYYYMMDD_HHMM.md: Filtered and enriched articles in Markdown format
 
 Usage:
     poetry run python physics-journals-feed.py
@@ -782,10 +782,10 @@ def write_yaml_file(entries: List[FeedEntry], output_path: Path) -> None:
         logger.info(f"✅ Successfully wrote {len(entries)} entries to {output_path}")
     
     except OSError as e:
-        logger.error(f"❌ File system error writing YAML file: {e}")
+        logger.error(f"❌ File system error writing {output_path}: {e}")
         raise
     except Exception as e:
-        logger.error(f"❌ Unexpected error writing YAML file: {e}")
+        logger.error(f"❌ Unexpected error writing {output_path}: {e}")
         raise
 
 
@@ -857,13 +857,13 @@ def write_markdown_file(entries: List[FeedEntry], output_path: Path, keyword_gro
                 for i, entry in enumerate(source_entries, 1):
                     f.write(entry.to_markdown_table(i))
         
-        logger.info(f"Wrote {len(entries)} entries to {output_path}")
+        logger.info(f"✅ Successfully wrote {len(entries)} entries to {output_path}")
     
     except OSError as e:
-        logger.error(f"File system error writing Markdown file: {e}")
+        logger.error(f"❌ File system error writing {output_path}: {e}")
         raise
     except Exception as e:
-        logger.error(f"Unexpected error writing Markdown file: {e}")
+        logger.error(f"❌ Unexpected error writing {output_path}: {e}")
         raise
 
 
@@ -895,15 +895,17 @@ def load_config() -> Dict[str, Any]:
             feed_url_data = data.get("Feed-URL", {})
             
             # Handle different keyword data formats and edge cases
+            no_filtering_msg = "⚠️  Keywords section is empty - keyword filtering is DISABLED. All articles will be included."
+            
             if keywords_data is None or (isinstance(keywords_data, dict) and not keywords_data):
                 # Empty or None keywords section - disable keyword filtering
                 keyword_groups = {}
-                logger.warning("⚠️  Keywords section is empty - keyword filtering is DISABLED. All articles will be included.")
+                logger.warning(no_filtering_msg)
             elif isinstance(keywords_data, list):
                 # Old format: convert to single group (backwards compatibility)
                 if not keywords_data:
                     keyword_groups = {}
-                    logger.warning("⚠️  Keywords list is empty - keyword filtering is DISABLED. All articles will be included.")
+                    logger.warning(no_filtering_msg)
                 else:
                     keyword_groups = {"Default Group": keywords_data}
                     logger.info(f"Loaded {len(keywords_data)} keywords in legacy format from {INPUT_FILE}")
@@ -915,17 +917,15 @@ def load_config() -> Dict[str, Any]:
                     group_summary = ", ".join([f"{name}({len(group)} keywords)" for name, group in keyword_groups.items()])
                     logger.info(f"Loaded {total_keywords} keywords in {len(keyword_groups)} groups from {INPUT_FILE}: {group_summary}")
                 else:
-                    logger.warning("⚠️  Keywords section is empty - keyword filtering is DISABLED. All articles will be included.")
+                    logger.warning(no_filtering_msg)
             
             # Convert Feed-URL structure to list of feed info
             feed_info = []
             for description, urls in feed_url_data.items():
-                if isinstance(urls, list):
-                    for url in urls:
-                        feed_info.append({"description": description, "url": url})
-                else:
-                    # Handle single URL case
-                    feed_info.append({"description": description, "url": urls})
+                # Normalize to list format for consistent processing
+                url_list = urls if isinstance(urls, list) else [urls]
+                for url in url_list:
+                    feed_info.append({"description": description, "url": url})
             
             logger.info(f"Loaded {len(feed_info)} feeds from {INPUT_FILE}")
             
@@ -1174,9 +1174,11 @@ def enrich_single_entry_with_arxiv(entry: FeedEntry) -> FeedEntry:
         Enriched FeedEntry with arXiv data, or original entry if no match found
     """
     arxiv_matcher = ArxivMatcher()
+    # Helper to consistently truncate titles for logging
+    title_preview = f"{entry.title[:60]}..." if len(entry.title) > 60 else entry.title
     
     try:
-        logger.debug(f"🔍 Searching arXiv for: {entry.title[:60]}...")
+        logger.debug(f"🔍 Searching arXiv for: {title_preview}")
         
         # Attempt to find matching arXiv article using title and author matching
         arxiv_match = arxiv_matcher.find_matching_article(entry.title, entry.authors)
@@ -1194,15 +1196,15 @@ def enrich_single_entry_with_arxiv(entry: FeedEntry) -> FeedEntry:
                 keywords=entry.keywords,         # Preserve matched keywords
                 source_feed=entry.source_feed    # Preserve original feed source
             )
-            logger.info(f"🔖 Enriched with arXiv data: {entry.title[:60]}...")
+            logger.info(f"🔖 Enriched with arXiv data: {title_preview}")
             return enriched_entry
         else:
             # Keep original entry when no suitable arXiv match is found
-            logger.debug(f"❌ No arXiv match found: {entry.title[:60]}...")
+            logger.debug(f"❌ No arXiv match found: {title_preview}")
             return entry
     
     except Exception as e:
-        logger.error(f"❌ Failed to enrich entry '{entry.title[:60]}...': {e}")
+        logger.error(f"❌ Failed to enrich entry '{title_preview}': {e}")
         return entry  # Return original entry on error to prevent data loss
 
 
@@ -1285,7 +1287,7 @@ def main() -> None:
         
         # Generate timestamped markdown filename to avoid overwriting previous runs
         timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-        OUTPUT_MARKDOWN_FILE = Path(f"Results/APS_{timestamp}.md")
+        OUTPUT_MARKDOWN_FILE = Path(f"Results/Aps_{timestamp}.md")
         logger.info(f"📝 Output will be saved to: {OUTPUT_MARKDOWN_FILE}")
         
         # Load configuration from YAML input file
