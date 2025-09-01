@@ -16,10 +16,17 @@ from typing import Any, Dict, List, Optional
 import feedparser
 import requests
 from bs4 import BeautifulSoup
+from rapidfuzz import fuzz, process
 
-from .config import (ARXIV_BATCH_SIZE, MAX_ARXIV_RESULTS, MAX_ARXIV_WORKERS,
-                     MAX_SEARCH_WORDS, MIN_WORD_LENGTH, REQUEST_TIMEOUT,
-                     TITLE_SIMILARITY_THRESHOLD, get_session)
+from .config import (ARXIV_BATCH_SIZE, AUTHOR_FUZZY_THRESHOLD,
+                     MAX_ARXIV_RESULTS, MAX_ARXIV_WORKERS, MAX_SEARCH_WORDS,
+                     MIN_WORD_LENGTH, REQUEST_TIMEOUT,
+                     TITLE_FUZZY_WEIGHT_INTERSECTION,
+                     TITLE_FUZZY_WEIGHT_PARTIAL, TITLE_FUZZY_WEIGHT_RATIO,
+                     TITLE_FUZZY_WEIGHT_TOKEN_SET,
+                     TITLE_FUZZY_WEIGHT_TOKEN_SORT,
+                     TITLE_FUZZY_WEIGHT_WORD_FUZZY, TITLE_SIMILARITY_THRESHOLD,
+                     get_session)
 from .models import FeedEntry
 from .utils import check_keywords
 
@@ -391,7 +398,22 @@ class ArxivMatcher:
         return word
     
     def calculate_title_similarity(self, title1: str, title2: str) -> float:
-        """Calculate similarity between two titles based on alphabetic word overlap."""
+        """
+        Calculate similarity between two titles using multiple fuzzy matching approaches.
+        
+        Combines several similarity metrics to provide robust title matching:
+        1. Word-based intersection similarity (original method)
+        2. Fuzzy string similarity for overall title matching
+        3. Fuzzy partial matching for handling title variations
+        
+        Args:
+            title1: First title to compare
+            title2: Second title to compare
+            
+        Returns:
+            Float between 0.0 and 1.0 representing similarity confidence
+        """
+        # Method 1: Original word-based intersection similarity
         words1_raw = self.extract_title_words(title1)
         words2_raw = self.extract_title_words(title2)
         
@@ -399,18 +421,92 @@ class ArxivMatcher:
         words1 = set(self.normalize_word(word) for word in words1_raw)
         words2 = set(self.normalize_word(word) for word in words2_raw)
         
-        if not words1 or not words2:
-            return 0.0
+        word_similarity = 0.0
+        if words1 and words2:
+            # Calculate intersection over minimum (more lenient than Jaccard)
+            intersection = len(words1.intersection(words2))
+            min_length = min(len(words1), len(words2))
+            word_similarity = intersection / min_length if min_length > 0 else 0.0
         
-        # Calculate intersection over minimum (more lenient than Jaccard)
-        # This helps when one title has more descriptive words than the other
-        intersection = len(words1.intersection(words2))
-        min_length = min(len(words1), len(words2))
+        # Method 2: Fuzzy string similarity on cleaned titles
+        # Clean titles for fuzzy matching
+        clean_title1 = self._clean_title_for_fuzzy_match(title1)
+        clean_title2 = self._clean_title_for_fuzzy_match(title2)
         
-        return intersection / min_length if min_length > 0 else 0.0
+        # Use multiple fuzzy matching algorithms
+        ratio_similarity = fuzz.ratio(clean_title1, clean_title2) / 100.0
+        partial_similarity = fuzz.partial_ratio(clean_title1, clean_title2) / 100.0
+        token_sort_similarity = fuzz.token_sort_ratio(clean_title1, clean_title2) / 100.0
+        token_set_similarity = fuzz.token_set_ratio(clean_title1, clean_title2) / 100.0
+        
+        # Method 3: Fuzzy matching on key word strings
+        words1_str = ' '.join(words1)
+        words2_str = ' '.join(words2)
+        word_fuzzy_similarity = fuzz.ratio(words1_str, words2_str) / 100.0 if words1_str and words2_str else 0.0
+        
+        # Combine all similarity scores with weighted average
+        # Use configurable weights for different matching methods
+        combined_similarity = (
+            word_similarity * TITLE_FUZZY_WEIGHT_INTERSECTION +           # Original word intersection method
+            ratio_similarity * TITLE_FUZZY_WEIGHT_RATIO +                 # Overall string similarity
+            partial_similarity * TITLE_FUZZY_WEIGHT_PARTIAL +             # Partial matching for title variations
+            token_sort_similarity * TITLE_FUZZY_WEIGHT_TOKEN_SORT +       # Order-independent word matching
+            token_set_similarity * TITLE_FUZZY_WEIGHT_TOKEN_SET +         # Set-based token matching
+            word_fuzzy_similarity * TITLE_FUZZY_WEIGHT_WORD_FUZZY         # Fuzzy matching on key words
+        )
+        
+        logger.debug(f"Title similarity breakdown:")
+        logger.debug(f"  Word intersection: {word_similarity:.3f}")
+        logger.debug(f"  Fuzzy ratio: {ratio_similarity:.3f}")
+        logger.debug(f"  Fuzzy partial: {partial_similarity:.3f}")
+        logger.debug(f"  Token sort: {token_sort_similarity:.3f}")
+        logger.debug(f"  Token set: {token_set_similarity:.3f}")
+        logger.debug(f"  Word fuzzy: {word_fuzzy_similarity:.3f}")
+        logger.debug(f"  Combined: {combined_similarity:.3f}")
+        
+        return combined_similarity
+    
+    def _clean_title_for_fuzzy_match(self, title: str) -> str:
+        """
+        Clean title for fuzzy string matching by removing/normalizing problematic characters.
+        
+        Args:
+            title: Raw title string
+            
+        Returns:
+            Cleaned title suitable for fuzzy matching
+        """
+        # Convert to lowercase for case-insensitive matching
+        clean_title = title.lower()
+        
+        # Remove common mathematical notation that can interfere with matching
+        clean_title = re.sub(r'[\$\{\}\[\]\\^_{}]', '', clean_title)
+        
+        # Normalize whitespace
+        clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+        
+        # Remove common prefixes/suffixes that might differ between venues
+        clean_title = re.sub(r'^(the\s+)?', '', clean_title)
+        clean_title = re.sub(r'\s+(article|paper|study)$', '', clean_title)
+        
+        return clean_title
     
     def search_arxiv(self, title: str, max_results: int = MAX_ARXIV_RESULTS) -> List[Dict[str, Any]]:
-        """Search arXiv for articles matching the title."""
+        """
+        Search arXiv for articles matching the title using enhanced keyword strategies.
+        
+        Uses multiple search approaches:
+        1. Original keyword-based search
+        2. Enhanced keyword selection with better prioritization
+        3. Multiple search queries with different keyword combinations
+        
+        Args:
+            title: Article title to search for
+            max_results: Maximum number of results to return
+            
+        Returns:
+            List of arXiv article entries
+        """
         try:
             # Extract key words from the title for search
             title_words = self.extract_title_words(title)
@@ -419,28 +515,27 @@ class ArxivMatcher:
                 logger.warning(f"No meaningful words extracted from title: '{title}'")
                 return []
             
-            # Use key words for search (take first N most distinctive words)
-            search_words = title_words[:MAX_SEARCH_WORDS]
-            search_query = ' '.join(search_words)
+            # Strategy 1: Original search with first N words
+            primary_search_words = title_words[:MAX_SEARCH_WORDS]
+            primary_results = self._perform_arxiv_search(primary_search_words, max_results // 2)
             
-            params = {
-                "search_query": f'ti:{search_query}',
-                "start": 0,
-                "max_results": max_results,
-            }
+            # Strategy 2: Enhanced search with better keyword selection
+            enhanced_keywords = self._select_enhanced_keywords(title_words, MAX_SEARCH_WORDS)
+            enhanced_results = self._perform_arxiv_search(enhanced_keywords, max_results // 2)
             
-            url = f"{self.base_url}?" + urllib.parse.urlencode(params)
-            logger.debug(f"Searching arXiv with keywords: '{search_query}'")
+            # Combine and deduplicate results
+            all_results = primary_results + enhanced_results
+            seen_titles = set()
+            unique_results = []
             
-            # Use optimized session for better performance
-            session = get_session()
-            response = session.get(url, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
+            for result in all_results:
+                title_key = result.get("title", "").strip().lower()
+                if title_key and title_key not in seen_titles:
+                    seen_titles.add(title_key)
+                    unique_results.append(result)
             
-            parsed = feedparser.parse(response.text)
-            results = list(parsed.get("entries", []))
-            
-            return results
+            logger.debug(f"ArXiv search returned {len(unique_results)} unique results")
+            return unique_results[:max_results]
         
         except requests.RequestException as e:
             logger.warning(f"Network error during arXiv search for '{title}': {e}")
@@ -448,6 +543,105 @@ class ArxivMatcher:
         except Exception as e:
             logger.warning(f"Unexpected error during arXiv search for '{title}': {e}")
             return []
+    
+    def _perform_arxiv_search(self, search_words: List[str], max_results: int) -> List[Dict[str, Any]]:
+        """Perform actual arXiv API search with given keywords."""
+        if not search_words:
+            return []
+        
+        search_query = ' '.join(search_words)
+        params = {
+            "search_query": f'ti:{search_query}',
+            "start": 0,
+            "max_results": max_results,
+        }
+        
+        url = f"{self.base_url}?" + urllib.parse.urlencode(params)
+        logger.debug(f"Searching arXiv with keywords: '{search_query}'")
+        
+        # Use optimized session for better performance
+        session = get_session()
+        response = session.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        
+        parsed = feedparser.parse(response.text)
+        return list(parsed.get("entries", []))
+    
+    def _select_enhanced_keywords(self, title_words: List[str], max_words: int) -> List[str]:
+        """
+        Select enhanced keywords using better prioritization strategies.
+        
+        Prioritizes words that are more likely to be distinctive for scientific articles.
+        
+        Args:
+            title_words: List of extracted title words
+            max_words: Maximum number of keywords to select
+            
+        Returns:
+            List of selected keywords for search
+        """
+        if len(title_words) <= max_words:
+            return title_words
+        
+        # Define word categories with different priorities
+        high_priority_words = []
+        medium_priority_words = []
+        low_priority_words = []
+        
+        # Scientific terms that are often distinctive
+        scientific_indicators = {
+            'quantum', 'magnetic', 'electronic', 'optical', 'thermal', 'mechanical',
+            'superconducting', 'ferromagnetic', 'antiferromagnetic', 'topological',
+            'phase', 'transition', 'crystal', 'molecular', 'atomic', 'nuclear',
+            'photonic', 'plasmonic', 'metamaterial', 'nanoscale', 'microscale'
+        }
+        
+        # Physics-specific terms
+        physics_terms = {
+            'field', 'wave', 'particle', 'energy', 'momentum', 'spin', 'charge',
+            'current', 'voltage', 'resistance', 'conductivity', 'temperature',
+            'pressure', 'density', 'frequency', 'wavelength', 'amplitude'
+        }
+        
+        for word in title_words:
+            word_lower = word.lower()
+            
+            # High priority: distinctive scientific terms
+            if word_lower in scientific_indicators:
+                high_priority_words.append(word)
+            # Medium priority: physics terms and longer words
+            elif word_lower in physics_terms or len(word) >= 7:
+                medium_priority_words.append(word)
+            # Low priority: common words
+            else:
+                low_priority_words.append(word)
+        
+        # Select keywords in priority order
+        selected_keywords = []
+        
+        # Add high priority words first
+        for word in high_priority_words[:max_words]:
+            selected_keywords.append(word)
+        
+        # Fill remaining slots with medium priority words
+        remaining_slots = max_words - len(selected_keywords)
+        for word in medium_priority_words[:remaining_slots]:
+            selected_keywords.append(word)
+        
+        # Fill any remaining slots with low priority words
+        remaining_slots = max_words - len(selected_keywords)
+        for word in low_priority_words[:remaining_slots]:
+            selected_keywords.append(word)
+        
+        # If we still don't have enough words, use original order
+        if len(selected_keywords) < max_words:
+            for word in title_words:
+                if word not in selected_keywords:
+                    selected_keywords.append(word)
+                    if len(selected_keywords) >= max_words:
+                        break
+        
+        return selected_keywords[:max_words]
     
     def extract_arxiv_authors(self, entry: Dict[str, Any]) -> List[str]:
         """Extract author names from arXiv entry."""
@@ -464,7 +658,23 @@ class ArxivMatcher:
         arxiv_authors: List[str], 
         check_first_two_only: bool = False
     ) -> bool:
-        """Check if first/second PRL author appears in arXiv authors."""
+        """
+        Check if PRL authors match arXiv authors using fuzzy string matching.
+        
+        Uses multiple matching strategies:
+        1. Exact substring matching (original method)
+        2. Last name exact matching
+        3. Fuzzy string matching for name variations
+        4. Initials + last name matching
+        
+        Args:
+            prl_authors: List of author names from PRL article
+            arxiv_authors: List of author names from arXiv article
+            check_first_two_only: Whether to only check first two PRL authors
+            
+        Returns:
+            True if at least one author match is found
+        """
         if not prl_authors or not arxiv_authors:
             return False
         
@@ -481,20 +691,87 @@ class ArxivMatcher:
                 if not arxiv_author:
                     continue
                 
-                # Extract last names for better matching
-                prl_last = prl_author.split()[-1].lower() if prl_author.split() else ""
-                arxiv_last = arxiv_author.split()[-1].lower() if arxiv_author.split() else ""
+                # Strategy 1: Original exact matching
+                if self._exact_author_match(prl_author, arxiv_author):
+                    logger.debug(f"Exact author match: '{prl_author}' ~ '{arxiv_author}'")
+                    return True
                 
-                # Match if:
-                # 1. Full name matches (in either direction)
-                # 2. Last names match
-                if (prl_author.lower() in arxiv_author.lower() or 
-                    arxiv_author.lower() in prl_author.lower() or
-                    (prl_last and arxiv_last and prl_last == arxiv_last)):
-                    logger.debug(f"Author match found: '{prl_author}' ~ '{arxiv_author}'")
+                # Strategy 2: Fuzzy matching for name variations
+                if self._fuzzy_author_match(prl_author, arxiv_author):
+                    logger.debug(f"Fuzzy author match: '{prl_author}' ~ '{arxiv_author}'")
+                    return True
+                
+                # Strategy 3: Initials + last name matching
+                if self._initials_author_match(prl_author, arxiv_author):
+                    logger.debug(f"Initials author match: '{prl_author}' ~ '{arxiv_author}'")
                     return True
         
         return False
+    
+    def _exact_author_match(self, prl_author: str, arxiv_author: str) -> bool:
+        """Check for exact author name matches using original method."""
+        # Extract last names for comparison
+        prl_last = prl_author.split()[-1].lower() if prl_author.split() else ""
+        arxiv_last = arxiv_author.split()[-1].lower() if arxiv_author.split() else ""
+        
+        # Match if:
+        # 1. Full name matches (in either direction)
+        # 2. Last names match exactly
+        return (prl_author.lower() in arxiv_author.lower() or 
+                arxiv_author.lower() in prl_author.lower() or
+                (prl_last and arxiv_last and prl_last == arxiv_last))
+    
+    def _fuzzy_author_match(self, prl_author: str, arxiv_author: str, threshold: float = AUTHOR_FUZZY_THRESHOLD) -> bool:
+        """Check for fuzzy author name matches to handle variations."""
+        # Clean author names for comparison
+        prl_clean = re.sub(r'[^\w\s]', '', prl_author.lower()).strip()
+        arxiv_clean = re.sub(r'[^\w\s]', '', arxiv_author.lower()).strip()
+        
+        if not prl_clean or not arxiv_clean:
+            return False
+        
+        # Use fuzzy string matching
+        similarity = fuzz.ratio(prl_clean, arxiv_clean)
+        
+        # Also try partial matching for cases like "John Smith" vs "Smith, John"
+        partial_similarity = fuzz.partial_ratio(prl_clean, arxiv_clean)
+        
+        # Use the better of the two scores
+        best_similarity = max(similarity, partial_similarity)
+        
+        return best_similarity >= threshold
+    
+    def _initials_author_match(self, prl_author: str, arxiv_author: str) -> bool:
+        """Check for matches using initials + last name pattern."""
+        def extract_initials_lastname(name: str) -> tuple:
+            """Extract initials and last name from author name."""
+            parts = name.strip().split()
+            if len(parts) < 2:
+                return ("", "")
+            
+            # Last part is assumed to be last name
+            last_name = parts[-1].lower()
+            
+            # Extract initials from first/middle names
+            initials = "".join([part[0].lower() for part in parts[:-1] if part])
+            
+            return (initials, last_name)
+        
+        prl_initials, prl_last = extract_initials_lastname(prl_author)
+        arxiv_initials, arxiv_last = extract_initials_lastname(arxiv_author)
+        
+        # Match if last names match and initials are compatible
+        if not (prl_last and arxiv_last and prl_initials and arxiv_initials):
+            return False
+        
+        # Last names must match
+        if prl_last != arxiv_last:
+            return False
+        
+        # Check if initials are compatible (one is subset of other)
+        return (prl_initials in arxiv_initials or 
+                arxiv_initials in prl_initials or
+                prl_initials == arxiv_initials)
     
     def extract_arxiv_summary(self, entry: Dict[str, Any]) -> str:
         """Extract clean summary from arXiv entry."""

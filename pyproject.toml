@@ -1,9 +1,10 @@
 [tool.poetry]
-name = "all-python"
+name = "aps-feed"
 version = "0.1.0"
-description = ""
+description = "Physics Journals Feed Processor with arXiv enrichment"
 authors = ["KK <ks.merikanto@gmail.com>"]
 readme = "README.md"
+package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.11"
@@ -19,6 +20,7 @@ asyncio = "^4.0.0"
 flask = "^3.1.2"
 html-to-json = "^2.0.0"
 mattermostdriver = "^7.3.2"
+rapidfuzz = "^3.10.1"
 
 
 [build-system]

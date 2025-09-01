@@ -32,8 +32,17 @@ MAX_ARXIV_WORKERS = 15        # Maximum parallel workers for arXiv enrichment
 ARXIV_BATCH_SIZE = 50         # Process arXiv in batches to optimize memory/performance
 
 # Article matching thresholds
-TITLE_SIMILARITY_THRESHOLD = 0.9  # Minimum title similarity for arXiv matching (0.0-1.0)
-MIN_WORD_LENGTH = 3               # Minimum word length for title processing
+TITLE_SIMILARITY_THRESHOLD = 0.75  # Minimum title similarity for arXiv matching (0.0-1.0) - reduced for fuzzy matching
+MIN_WORD_LENGTH = 3                # Minimum word length for title processing
+
+# Fuzzy matching thresholds
+AUTHOR_FUZZY_THRESHOLD = 85.0      # Minimum fuzzy match score for author names (0.0-100.0)
+TITLE_FUZZY_WEIGHT_INTERSECTION = 0.3    # Weight for word intersection similarity
+TITLE_FUZZY_WEIGHT_RATIO = 0.15          # Weight for fuzzy ratio similarity
+TITLE_FUZZY_WEIGHT_PARTIAL = 0.1         # Weight for fuzzy partial similarity
+TITLE_FUZZY_WEIGHT_TOKEN_SORT = 0.25     # Weight for token sort similarity
+TITLE_FUZZY_WEIGHT_TOKEN_SET = 0.1       # Weight for token set similarity
+TITLE_FUZZY_WEIGHT_WORD_FUZZY = 0.1      # Weight for word-level fuzzy similarity
 
 # Search optimization
 MAX_SEARCH_WORDS = 6          # Maximum number of title words to use in arXiv search queries
