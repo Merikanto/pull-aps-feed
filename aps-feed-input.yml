@@ -5,7 +5,7 @@ Keywords:
     - Gross-Pitaevskii
   Group 2:
     - Bose-Einstein
-    - Symmetry
+    - atom
 
 
 # From APS RSS Feeds: https://journals.aps.org/feeds
@@ -149,3 +149,6 @@ Feed-URL:
 
   # Recently published in PRX:
   # - https://feeds.aps.org/rss/recent/prx.xml
+
+  # PRB - Electronic structure and strongly correlated systems:
+  # - https://feeds.aps.org/rss/tocsec/PRB-Electronicstructurewidebandnarrowbandandstronglycorrelatedsystems.xml
