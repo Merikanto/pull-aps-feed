@@ -639,8 +639,8 @@ class ArxivMatcher:
         try:
             # Try multiple query formats, starting with most compatible
             query_attempts = [
-                f'all:{search_query}',   # All-fields search (most compatible)
-                f'ti:{search_query}',    # Unquoted title search 
+                search_query,            # Simple keyword search (most compatible)
+                f'ti:{search_query}',    # Title search 
                 f'au:{search_query}'     # Author search (if title fails)
             ]
             
@@ -951,7 +951,7 @@ class ArxivMatcher:
         title: str, 
         authors: List[str]
     ) -> Optional[Dict[str, str]]:
-        """Find matching arXiv article for given title and authors using optimized matching."""
+        """Find matching arXiv article for given title and authors using optimized matching with fallback strategies."""
         logger.info(f"Searching arXiv for: '{title}'")
         
         # Quick pre-filter: skip articles with very short titles (likely not research papers)
@@ -959,11 +959,44 @@ class ArxivMatcher:
             logger.debug(f"Skipping short title: '{title}'")
             return None
         
-        arxiv_results = self.search_arxiv(title)
-        if not arxiv_results:
-            logger.debug(f"No arXiv results found for '{title}'")
-            return None
+        # Primary Strategy: Use API search
+        rate_limit_count = get_rate_limit_count()
+        api_blocked = rate_limit_count > 20  # If many 406/429 errors, API is likely blocked
         
+        if not api_blocked:
+            # Try normal API search first
+            arxiv_results = self.search_arxiv(title)
+            if arxiv_results:
+                return self._process_search_results(title, authors, arxiv_results)
+        
+        # Fallback Strategy: Alternative search methods when API is blocked/failing
+        logger.info(f"🔄 Primary search failed - trying alternative strategies for: '{title[:50]}...'")
+        
+        # Strategy 1: Direct arXiv ID extraction from title/text
+        direct_match = self._try_direct_arxiv_id_extraction(title)
+        if direct_match:
+            return direct_match
+        
+        # Strategy 2: Author-based search with simplified queries
+        if authors:
+            author_match = self._try_author_based_search(title, authors)
+            if author_match:
+                return author_match
+        
+        # Strategy 3: Web-based verification (last resort)
+        web_match = self._try_web_based_search(title, authors)
+        if web_match:
+            return web_match
+        
+        # Check if this is due to systematic API blocking
+        if api_blocked:
+            logger.warning(f"⚠️ arXiv API may be blocking requests - '{title}' enrichment skipped")
+        else:
+            logger.debug(f"No arXiv results found for '{title}'")
+        return None
+    
+    def _process_search_results(self, title: str, authors: List[str], arxiv_results: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+        """Process arXiv search results and find best match."""
         logger.debug(f"Found {len(arxiv_results)} potential matches, checking title similarity and authors...")
         
         best_match = None
@@ -1011,7 +1044,249 @@ class ArxivMatcher:
                 "link": link
             }
         
-        logger.info(f"No suitable match found (need {TITLE_SIMILARITY_THRESHOLD*100:.0f}%+ alphabetic word similarity + first/second author match)")
+        return None
+    
+    def _try_direct_arxiv_id_extraction(self, title: str) -> Optional[Dict[str, str]]:
+        """
+        Try to extract arXiv ID directly from title or look for known patterns.
+        
+        This method attempts to find arXiv identifiers that might be embedded
+        in the title or use pattern matching for well-known paper formats.
+        """
+        logger.debug("🔍 Trying direct arXiv ID extraction...")
+        
+        # Look for arXiv ID patterns in title (sometimes papers reference their arXiv version)
+        arxiv_id_pattern = r'(?:arXiv:)?(\d{4}\.\d{4,5}(?:v\d+)?)'
+        match = re.search(arxiv_id_pattern, title, re.IGNORECASE)
+        
+        if match:
+            arxiv_id = match.group(1)
+            logger.info(f"🎯 Found arXiv ID in title: {arxiv_id}")
+            
+            # Construct arXiv link directly
+            arxiv_link = f"http://arxiv.org/abs/{arxiv_id}"
+            
+            # Try to get summary by direct API call to this specific paper
+            try:
+                paper_details = self._get_paper_details_by_id(arxiv_id)
+                if paper_details:
+                    return {
+                        "summary": paper_details.get("summary", ""),
+                        "link": arxiv_link
+                    }
+            except Exception as e:
+                logger.debug(f"Failed to get details for arXiv:{arxiv_id}: {e}")
+            
+            # Even if we can't get summary, return the link
+            return {
+                "summary": "",
+                "link": arxiv_link
+            }
+        
+        return None
+    
+    def _try_author_based_search(self, title: str, authors: List[str]) -> Optional[Dict[str, str]]:
+        """
+        Try simplified author-based search when main API search fails.
+        
+        Uses only author names with very simple queries to avoid API rejection.
+        """
+        logger.debug("🔍 Trying author-based search...")
+        
+        # Try with first author only using very simple query format
+        if not authors:
+            return None
+        
+        first_author = authors[0]
+        # Extract just the last name for search
+        author_parts = first_author.strip().split()
+        if not author_parts:
+            return None
+        
+        last_name = author_parts[-1]
+        
+        # Use very simple search query
+        simple_query = last_name.lower()
+        
+        try:
+            # Direct API call with minimal query
+            params = {
+                "search_query": f"au:{simple_query}",
+                "start": 0,
+                "max_results": 20,  # Get more results for author search
+            }
+            
+            session = get_session()
+            url = f"{self.base_url}?" + urllib.parse.urlencode(params)
+            response = session.get(url, timeout=REQUEST_TIMEOUT)
+            
+            if response.status_code == 200:
+                parsed = feedparser.parse(response.text)
+                results = list(parsed.get("entries", []))
+                
+                if results:
+                    logger.debug(f"Found {len(results)} results for author '{last_name}', checking for title matches...")
+                    return self._process_search_results(title, authors, results)
+            
+        except Exception as e:
+            logger.debug(f"Author-based search failed: {e}")
+        
+        return None
+    
+    def _try_web_based_search(self, title: str, authors: List[str]) -> Optional[Dict[str, str]]:
+        """
+        Last resort: Try web-based search using search engines or direct arXiv search.
+        
+        This method uses web scraping techniques to find arXiv papers when the API fails.
+        """
+        logger.debug("🔍 Trying web-based search (last resort)...")
+        
+        # Extract key terms from title for web search
+        title_words = self.extract_title_words(title)
+        if len(title_words) < 2:
+            return None
+        
+        # Use top 3-4 most distinctive words
+        search_terms = title_words[:4]
+        
+        # Try arXiv search page directly
+        try:
+            # Construct arXiv search URL (their web interface)
+            search_query = "+".join(search_terms)
+            search_url = f"https://arxiv.org/search/?query={search_query}&searchtype=all"
+            
+            session = get_session()
+            response = session.get(search_url, timeout=REQUEST_TIMEOUT * 2)  # Longer timeout for web scraping
+            
+            if response.status_code == 200:
+                # Parse the HTML response to look for matching papers
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # Look for paper links in search results
+                paper_links = soup.find_all('a', href=re.compile(r'/abs/\d{4}\.\d{4}'))
+                
+                for link in paper_links[:10]:  # Check first 10 results
+                    arxiv_url = f"https://arxiv.org{link['href']}"
+                    
+                    # Extract arXiv ID from URL
+                    arxiv_id_match = re.search(r'/abs/(\d{4}\.\d{4,5})', link['href'])
+                    if arxiv_id_match:
+                        arxiv_id = arxiv_id_match.group(1)
+                        
+                        # Get paper details
+                        try:
+                            paper_details = self._get_paper_details_by_web_scraping(arxiv_url)
+                            if paper_details:
+                                # Check if this paper matches our criteria
+                                web_title = paper_details.get("title", "")
+                                web_authors = paper_details.get("authors", [])
+                                
+                                if web_title and web_authors:
+                                    title_similarity = self.calculate_title_similarity(title, web_title)
+                                    author_match = self.verify_author_match(authors, web_authors, check_first_two_only=True)
+                                    
+                                    if title_similarity >= TITLE_SIMILARITY_THRESHOLD and author_match:
+                                        logger.info(f"🌐 Found match via web search: {arxiv_url}")
+                                        return {
+                                            "summary": paper_details.get("summary", ""),
+                                            "link": arxiv_url.replace("https://", "http://")  # Standardize to http
+                                        }
+                        except Exception as e:
+                            logger.debug(f"Failed to scrape {arxiv_url}: {e}")
+                            continue
+            
+        except Exception as e:
+            logger.debug(f"Web-based search failed: {e}")
+        
+        return None
+    
+    def _get_paper_details_by_id(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get paper details for a specific arXiv ID using direct API call.
+        
+        Args:
+            arxiv_id: arXiv identifier (e.g., "2408.11220")
+            
+        Returns:
+            Dictionary with paper details or None if failed
+        """
+        try:
+            params = {
+                "id_list": arxiv_id,
+                "max_results": 1,
+            }
+            
+            session = get_session()
+            url = f"{self.base_url}?" + urllib.parse.urlencode(params)
+            response = session.get(url, timeout=REQUEST_TIMEOUT)
+            
+            if response.status_code == 200:
+                parsed = feedparser.parse(response.text)
+                entries = list(parsed.get("entries", []))
+                
+                if entries:
+                    entry = entries[0]
+                    return {
+                        "title": entry.get("title", "").strip(),
+                        "summary": self.extract_arxiv_summary(entry),
+                        "authors": self.extract_arxiv_authors(entry),
+                        "link": self.get_arxiv_link(entry)
+                    }
+            
+        except Exception as e:
+            logger.debug(f"Direct ID lookup failed for {arxiv_id}: {e}")
+        
+        return None
+    
+    def _get_paper_details_by_web_scraping(self, arxiv_url: str) -> Optional[Dict[str, Any]]:
+        """
+        Get paper details by scraping the arXiv web page directly.
+        
+        Args:
+            arxiv_url: Full URL to arXiv paper page
+            
+        Returns:
+            Dictionary with paper details or None if failed
+        """
+        try:
+            session = get_session()
+            response = session.get(arxiv_url, timeout=REQUEST_TIMEOUT * 2)
+            
+            if response.status_code == 200:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # Extract title
+                title_elem = soup.find('h1', class_='title mathjax')
+                title = ""
+                if title_elem:
+                    title = title_elem.get_text().replace('Title:', '').strip()
+                
+                # Extract authors
+                authors = []
+                authors_elem = soup.find('div', class_='authors')
+                if authors_elem:
+                    author_links = authors_elem.find_all('a')
+                    authors = [link.get_text().strip() for link in author_links]
+                
+                # Extract abstract
+                abstract = ""
+                abstract_elem = soup.find('blockquote', class_='abstract mathjax')
+                if abstract_elem:
+                    abstract = abstract_elem.get_text().replace('Abstract:', '').strip()
+                
+                if title:  # Only return if we at least got a title
+                    return {
+                        "title": title,
+                        "summary": abstract,
+                        "authors": authors,
+                        "link": arxiv_url
+                    }
+            
+        except Exception as e:
+            logger.debug(f"Web scraping failed for {arxiv_url}: {e}")
+        
         return None
 
 
