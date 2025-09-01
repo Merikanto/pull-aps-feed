@@ -33,7 +33,7 @@ ARXIV_BATCH_SIZE = 200        # Large batches for maximum throughput
 ARXIV_REQUEST_DELAY = 0.02    # Minimal delay (20ms) for maximum speed
 
 # Article matching thresholds
-TITLE_SIMILARITY_THRESHOLD = 0.75  # Minimum title similarity for arXiv matching (0.0-1.0) - reduced for fuzzy matching
+TITLE_SIMILARITY_THRESHOLD = 0.70  # Reduced from 0.75 to catch more matches (like Multi-Band vs Multiband)
 MIN_WORD_LENGTH = 3                # Minimum word length for title processing
 
 # Fuzzy matching thresholds

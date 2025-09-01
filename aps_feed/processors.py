@@ -394,11 +394,22 @@ class ArxivMatcher:
         """Normalize a word for better matching."""
         # Handle common variations
         word = word.lower().strip()
-        # Handle hyphenated words
+        # Handle hyphenated words - normalize to non-hyphenated form
         if '-' in word:
-            # Convert "ultra-narrow" to "ultranarrow" for matching
+            # Convert "multi-band" to "multiband", "ultra-narrow" to "ultranarrow" 
             word = word.replace('-', '')
-        return word
+        
+        # Handle common scientific term variations
+        word_mappings = {
+            'hunt': 'search',
+            'investigate': 'study',
+            'explore': 'study',
+            'analyse': 'analyze',  # British vs American spelling
+            'realise': 'realize',
+            'optimise': 'optimize'
+        }
+        
+        return word_mappings.get(word, word)
     
     def calculate_title_similarity(self, title1: str, title2: str) -> float:
         """
@@ -486,6 +497,14 @@ class ArxivMatcher:
         
         # Remove common mathematical notation that can interfere with matching
         clean_title = re.sub(r'[\$\{\}\[\]\\^_{}]', '', clean_title)
+        
+        # Normalize hyphenation variations (Multi-Band → multiband)
+        clean_title = re.sub(r'\b(\w+)-(\w+)\b', r'\1\2', clean_title)
+        
+        # Normalize common verb variations for better matching
+        clean_title = re.sub(r'\bhunt\s+for\b', 'search for', clean_title)
+        clean_title = re.sub(r'\binvestigate\s+', 'study ', clean_title)
+        clean_title = re.sub(r'\bexplore\s+', 'study ', clean_title)
         
         # Normalize whitespace
         clean_title = re.sub(r'\s+', ' ', clean_title).strip()
