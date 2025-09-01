@@ -110,6 +110,47 @@ def main() -> None:
         logger.info(f"🔍 Starting arXiv enrichment for {len(entries)} articles...")
         arxiv_start_time = time.time()
         enriched_entries = enrich_with_arxiv(entries)
+        
+        # Post-processing: Check for missed enrichments and retry
+        missed_enrichments = [entry for entry in enriched_entries 
+                            if not entry.arxiv and len(entry.title.split()) >= 5]  # Skip very short titles
+        
+        if missed_enrichments:
+            logger.info(f"🔄 Found {len(missed_enrichments)} articles that may have missed enrichment, retrying...")
+            retry_start_time = time.time()
+            
+            # Retry with smaller batches and more conservative settings
+            from .processors import enrich_single_entry_with_arxiv
+
+            # Use smaller batch size and fewer workers for retry
+            retry_workers = min(10, len(missed_enrichments))  # Conservative retry parallelism
+            
+            retried_entries = []
+            with ThreadPoolExecutor(max_workers=retry_workers) as executor:
+                future_to_entry = {
+                    executor.submit(enrich_single_entry_with_arxiv, entry, 1): entry  # 1 retry max
+                    for entry in missed_enrichments
+                }
+                
+                for future in as_completed(future_to_entry):
+                    original_entry = future_to_entry[future]
+                    try:
+                        retried_entry = future.result()
+                        retried_entries.append(retried_entry)
+                    except Exception as e:
+                        logger.warning(f"Retry failed for '{original_entry.title[:50]}...': {e}")
+                        retried_entries.append(original_entry)
+            
+            # Replace original entries with retried entries
+            entry_map = {entry.title: entry for entry in retried_entries}
+            enriched_entries = [
+                entry_map.get(entry.title, entry) for entry in enriched_entries
+            ]
+            
+            retry_time = time.time() - retry_start_time
+            successful_retries = sum(1 for entry in retried_entries if entry.arxiv)
+            logger.info(f"🔄 Retry completed in {retry_time:.2f}s: {successful_retries}/{len(missed_enrichments)} successful")
+        
         arxiv_time = time.time() - arxiv_start_time
         logger.info(f"✅ arXiv enrichment completed in {arxiv_time:.2f}s")
         

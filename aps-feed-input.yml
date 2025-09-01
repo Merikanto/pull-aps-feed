@@ -1,21 +1,11 @@
 # Matching is done by groups of keywords
 Keywords:
   Group 1:
-  - Fractional Chern Insulator
-  #   - Bose-Einstein
-  #   - Gross-Pitaevskii
-  # Group 2:
-  #   - Bose-Einstein
-  #   - Fifth force
-  # Group 3:
-  #   - Bose-Einstein
-  #   - Symmetry
-  # Group 4:
-  #   - Bose-Einstein
-  #   - Dark matter
-  # Group 5:
-  #   - Bose-Einstein
-  #   - Effective field theory
+    - Bose-Einstein
+    - Gross-Pitaevskii
+  Group 2:
+    - Bose-Einstein
+    - Symmetry
 
 
 # From APS RSS Feeds: https://journals.aps.org/feeds

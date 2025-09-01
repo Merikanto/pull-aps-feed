@@ -26,7 +26,8 @@ from .config import (ARXIV_BATCH_SIZE, ARXIV_REQUEST_DELAY,
                      TITLE_FUZZY_WEIGHT_TOKEN_SET,
                      TITLE_FUZZY_WEIGHT_TOKEN_SORT,
                      TITLE_FUZZY_WEIGHT_WORD_FUZZY, TITLE_SIMILARITY_THRESHOLD,
-                     get_session, increment_rate_limit_count)
+                     get_rate_limit_count, get_session,
+                     increment_rate_limit_count)
 from .models import FeedEntry
 from .utils import check_keywords
 
@@ -347,6 +348,58 @@ class ArxivMatcher:
         """Initialize arXiv matcher with API configuration and caching."""
         self.base_url = "http://export.arxiv.org/api/query"
         self.search_cache = {}  # Simple cache to avoid duplicate searches
+    
+    def warm_cache_for_likely_matches(self, entries: List[FeedEntry]) -> None:
+        """
+        Pre-identify and cache search results for articles likely to have arXiv matches.
+        
+        This method analyzes titles to identify articles that are likely to have arXiv
+        preprints and performs searches for them early to warm the cache.
+        
+        Args:
+            entries: List of FeedEntry objects to analyze
+        """
+        # Identify articles likely to have arXiv matches based on title characteristics
+        likely_matches = []
+        
+        for entry in entries:
+            title = entry.title.lower()
+            
+            # Look for indicators of recent research that's likely on arXiv
+            indicators = [
+                'quantum', 'topological', 'superconducting', 'magnetic', 'electronic',
+                'phase transition', 'condensed matter', 'field theory', 'many-body',
+                'entanglement', 'correlation', 'simulation', 'calculation', 'study',
+                'theory', 'model', 'effect', 'properties', 'dynamics'
+            ]
+            
+            # Check if title contains research indicators and has sufficient length
+            if (len(entry.title.split()) >= 6 and  # Reasonable title length
+                any(indicator in title for indicator in indicators) and
+                not any(exclusion in title for exclusion in ['review', 'comment', 'erratum'])):
+                likely_matches.append(entry)
+        
+        if likely_matches:
+            logger.info(f"🔥 Pre-warming cache for {len(likely_matches)} likely arXiv matches...")
+            
+            # Perform searches for likely matches with conservative parallelism
+            cache_workers = min(5, len(likely_matches))  # Very conservative for cache warming
+            
+            with ThreadPoolExecutor(max_workers=cache_workers) as executor:
+                futures = [
+                    executor.submit(self.search_arxiv, entry.title, MAX_ARXIV_RESULTS)
+                    for entry in likely_matches[:20]  # Limit to first 20 to avoid overwhelming API
+                ]
+                
+                completed = 0
+                for future in as_completed(futures):
+                    try:
+                        future.result()  # Just trigger the search to warm cache
+                        completed += 1
+                    except Exception as e:
+                        logger.debug(f"Cache warming failed for one entry: {e}")
+            
+            logger.info(f"🔥 Cache warming completed: {completed}/{len(futures)} searches cached")
     
     def extract_title_words(self, title: str) -> List[str]:
         """
@@ -995,7 +1048,7 @@ def process_single_feed(feed_info: Dict[str, str], keyword_groups: Dict[str, Lis
         return []  # Return empty list to allow other feeds to continue processing
 
 
-def enrich_single_entry_with_arxiv(entry: FeedEntry) -> FeedEntry:
+def enrich_single_entry_with_arxiv(entry: FeedEntry, max_retries: int = 2) -> FeedEntry:
     """
     Enrich a single article entry with arXiv data if a match is found.
     
@@ -1005,6 +1058,7 @@ def enrich_single_entry_with_arxiv(entry: FeedEntry) -> FeedEntry:
     
     Args:
         entry: FeedEntry object to enrich
+        max_retries: Maximum number of retry attempts for failed enrichments
         
     Returns:
         Enriched FeedEntry with arXiv data, or original entry if no match found
@@ -1013,35 +1067,49 @@ def enrich_single_entry_with_arxiv(entry: FeedEntry) -> FeedEntry:
     # Helper to consistently truncate titles for logging
     title_preview = f"{entry.title[:60]}..." if len(entry.title) > 60 else entry.title
     
-    try:
-        logger.debug(f"🔍 Searching arXiv for: {title_preview}")
+    for attempt in range(max_retries + 1):
+        try:
+            logger.debug(f"🔍 Searching arXiv for: {title_preview} (attempt {attempt + 1})")
+            
+            # Add small delay between retries to avoid API conflicts
+            if attempt > 0:
+                retry_delay = ARXIV_REQUEST_DELAY * (2 ** attempt)  # Exponential backoff
+                logger.debug(f"⏱️ Retry delay: {retry_delay:.2f}s")
+                time.sleep(retry_delay)
+            
+            # Attempt to find matching arXiv article using title and author matching
+            arxiv_match = arxiv_matcher.find_matching_article(entry.title, entry.authors)
+            
+            if arxiv_match:
+                # Create enriched entry with arXiv data while preserving original metadata
+                enriched_entry = FeedEntry(
+                    title=entry.title,
+                    authors=entry.authors,
+                    link=entry.link,
+                    doi=entry.doi,
+                    published=entry.published,
+                    summary=arxiv_match["summary"],  # Replace with richer arXiv summary
+                    arxiv=arxiv_match["link"],       # Add arXiv preprint link
+                    keywords=entry.keywords,         # Preserve matched keywords
+                    source_feed=entry.source_feed    # Preserve original feed source
+                )
+                logger.info(f"🔖 Enriched with arXiv data: {title_preview}")
+                return enriched_entry
+            else:
+                # Keep original entry when no suitable arXiv match is found
+                logger.debug(f"❌ No arXiv match found: {title_preview}")
+                return entry
         
-        # Attempt to find matching arXiv article using title and author matching
-        arxiv_match = arxiv_matcher.find_matching_article(entry.title, entry.authors)
-        
-        if arxiv_match:
-            # Create enriched entry with arXiv data while preserving original metadata
-            enriched_entry = FeedEntry(
-                title=entry.title,
-                authors=entry.authors,
-                link=entry.link,
-                doi=entry.doi,
-                published=entry.published,
-                summary=arxiv_match["summary"],  # Replace with richer arXiv summary
-                arxiv=arxiv_match["link"],       # Add arXiv preprint link
-                keywords=entry.keywords,         # Preserve matched keywords
-                source_feed=entry.source_feed    # Preserve original feed source
-            )
-            logger.info(f"🔖 Enriched with arXiv data: {title_preview}")
-            return enriched_entry
-        else:
-            # Keep original entry when no suitable arXiv match is found
-            logger.debug(f"❌ No arXiv match found: {title_preview}")
-            return entry
+        except Exception as e:
+            if attempt < max_retries:
+                logger.warning(f"⚠️ Attempt {attempt + 1} failed for '{title_preview}': {e}")
+                logger.info(f"🔄 Retrying enrichment (attempt {attempt + 2}/{max_retries + 1})...")
+                continue
+            else:
+                logger.error(f"❌ All {max_retries + 1} attempts failed for '{title_preview}': {e}")
+                return entry  # Return original entry on final failure to prevent data loss
     
-    except Exception as e:
-        logger.error(f"❌ Failed to enrich entry '{title_preview}': {e}")
-        return entry  # Return original entry on error to prevent data loss
+    return entry  # Fallback (should not reach here)
 
 
 def enrich_with_arxiv(entries: List[FeedEntry]) -> List[FeedEntry]:
@@ -1050,7 +1118,7 @@ def enrich_with_arxiv(entries: List[FeedEntry]) -> List[FeedEntry]:
     
     This function searches arXiv for matching articles and enriches the entries
     with arXiv summaries and links when matches are found. Processing is done
-    in parallel with batch optimization for better performance while respecting API limits.
+    in parallel with adaptive batch optimization for better performance while respecting API limits.
     
     Args:
         entries: List of FeedEntry objects to enrich
@@ -1059,7 +1127,7 @@ def enrich_with_arxiv(entries: List[FeedEntry]) -> List[FeedEntry]:
         List of enriched FeedEntry objects (same order as input)
         
     Note:
-        Uses optimized ThreadPoolExecutor with batch processing and connection pooling.
+        Uses adaptive ThreadPoolExecutor with dynamic batch sizing based on success rates.
         Failed enrichments gracefully fall back to original entry data.
     """
     if not entries:
@@ -1068,25 +1136,41 @@ def enrich_with_arxiv(entries: List[FeedEntry]) -> List[FeedEntry]:
     
     logger.info(f"🔍 Starting optimized arXiv enrichment for {len(entries)} articles...")
     
-    # Conservative batching for arXiv API limits
-    # Use smaller batches to respect arXiv API rate limits
-    optimal_batch_size = min(ARXIV_BATCH_SIZE, len(entries))  # Respect API limits
+    # Pre-warm cache for likely matches to improve success rate
+    if len(entries) > 50:  # Only for large batches where this helps
+        arxiv_matcher = ArxivMatcher()
+        arxiv_matcher.warm_cache_for_likely_matches(entries)
+    
+    # Start with optimal batch size but allow adaptive sizing
+    initial_batch_size = min(ARXIV_BATCH_SIZE, len(entries))
+    current_batch_size = initial_batch_size
     
     enriched_entries = []
-    total_batches = (len(entries) + optimal_batch_size - 1) // optimal_batch_size
+    total_batches = (len(entries) + current_batch_size - 1) // current_batch_size
     
-    logger.info(f"⚡ Using adaptive batching: {total_batches} batches of ~{optimal_batch_size} articles each")
+    logger.info(f"⚡ Using adaptive batching: starting with {current_batch_size} articles per batch")
     
-    for batch_num, i in enumerate(range(0, len(entries), optimal_batch_size), 1):
-        batch_entries = entries[i:i + optimal_batch_size]
+    batch_num = 0
+    for i in range(0, len(entries), current_batch_size):
+        batch_num += 1
+        batch_entries = entries[i:i + current_batch_size]
         batch_start_time = time.time()
-        logger.info(f"📦 📦 📦 Processing batch {batch_num}/{total_batches} ({len(batch_entries)} articles) 📦 📦 📦")
+        logger.info(f"📦 📦 📦 Processing batch {batch_num} ({len(batch_entries)} articles) 📦 📦 📦")
         
-        # Use more workers for larger batches
+        # Use more workers for larger batches, fewer for smaller batches
         max_workers = min(len(batch_entries), MAX_ARXIV_WORKERS)
+        
+        # Reduce workers if we've had API issues
+        rate_limit_count = get_rate_limit_count()
+        if rate_limit_count > 0:
+            max_workers = min(max_workers, 10)  # Be more conservative
+            logger.warning(f"⚠️ Reducing workers to {max_workers} due to {rate_limit_count} rate limit events")
+        
         logger.debug(f"⚡ Using {max_workers} parallel workers for batch {batch_num}")
         
         batch_enriched = []
+        successful_enrichments = 0
+        
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all enrichment tasks for this batch
             future_to_entry = {
@@ -1094,12 +1178,17 @@ def enrich_with_arxiv(entries: List[FeedEntry]) -> List[FeedEntry]:
                 for entry in batch_entries
             }
             
-            # Collect results as they complete (no need to wait for all)
+            # Collect results as they complete
             for future in as_completed(future_to_entry):
                 entry = future_to_entry[future]
                 try:
                     enriched_entry = future.result()
                     batch_enriched.append(enriched_entry)
+                    
+                    # Track successful enrichments (entries that got arXiv data)
+                    if enriched_entry.arxiv:
+                        successful_enrichments += 1
+                        
                 except Exception as e:
                     logger.error(f"Entry '{entry.title[:60]}...' generated an exception: {e}")
                     # Add the original entry if enrichment fails
@@ -1112,7 +1201,27 @@ def enrich_with_arxiv(entries: List[FeedEntry]) -> List[FeedEntry]:
         enriched_entries.extend(batch_enriched)
         batch_time = time.time() - batch_start_time
         avg_time_per_article = batch_time / len(batch_entries)
-        logger.info(f"✅ ✅ ✅ Completed batch {batch_num}/{total_batches} in {batch_time:.1f}s ({avg_time_per_article:.2f}s/article) ✅ ✅ ✅")
+        success_rate = (successful_enrichments / len(batch_entries)) * 100
+        
+        logger.info(f"✅ ✅ ✅ Completed batch {batch_num} in {batch_time:.1f}s ({avg_time_per_article:.2f}s/article, {success_rate:.1f}% enriched) ✅ ✅ ✅")
+        
+        # Adaptive batch sizing based on success rate and timing
+        if success_rate < 20 and current_batch_size > 20:
+            # Low success rate - reduce batch size
+            current_batch_size = max(20, current_batch_size // 2)
+            logger.info(f"📉 Low success rate ({success_rate:.1f}%) - reducing batch size to {current_batch_size}")
+        elif success_rate > 80 and batch_time < 3.0 and current_batch_size < initial_batch_size:
+            # High success rate and fast processing - increase batch size
+            current_batch_size = min(initial_batch_size, current_batch_size * 2)
+            logger.info(f"📈 High success rate ({success_rate:.1f}%) - increasing batch size to {current_batch_size}")
+        
+        # Recalculate remaining batches
+        remaining_entries = len(entries) - len(enriched_entries)
+        if remaining_entries > 0:
+            remaining_batches = (remaining_entries + current_batch_size - 1) // current_batch_size
+            logger.debug(f"📊 {remaining_entries} entries remaining in ~{remaining_batches} batches")
     
-    logger.info(f"🎉 Completed arXiv enrichment for all {len(enriched_entries)} articles")
+    total_enriched = sum(1 for entry in enriched_entries if entry.arxiv)
+    overall_success_rate = (total_enriched / len(enriched_entries)) * 100
+    logger.info(f"🎉 Completed arXiv enrichment for all {len(enriched_entries)} articles ({total_enriched} enriched, {overall_success_rate:.1f}% success rate)")
     return enriched_entries 
