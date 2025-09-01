@@ -7,10 +7,47 @@ deduplication, and other utility operations.
 
 import logging
 import re
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List
+
+if TYPE_CHECKING:
+    from .models import FeedEntry
 
 # Setup logger
 logger = logging.getLogger(__name__)
+
+
+def apply_keyword_filtering(entries: List['FeedEntry'], keyword_groups: Dict[str, List[str]]) -> List['FeedEntry']:
+    """
+    Apply keyword filtering to enriched articles.
+    
+    This function filters articles based on keyword group matching after arXiv enrichment.
+    Articles must match ALL keywords in at least one group to be included.
+    
+    Args:
+        entries: List of enriched FeedEntry objects to filter
+        keyword_groups: Dictionary mapping group names to lists of required keywords
+        
+    Returns:
+        List of FeedEntry objects that matched at least one keyword group
+    """
+    if not keyword_groups:
+        logger.info("📋 No keyword groups defined - including all articles")
+        return entries
+    
+    logger.info(f"🎯 Applying keyword filtering to {len(entries)} enriched articles...")
+    
+    filtered_entries = []
+    for entry in entries:
+        # Apply keyword matching to enriched content
+        matched_keywords = check_keywords(entry.title, entry.summary, keyword_groups)
+        
+        if matched_keywords and matched_keywords != ["​-​"]:  # Exclude the "no filtering" marker
+            # Update the entry with matched keywords
+            entry.keywords = matched_keywords
+            filtered_entries.append(entry)
+    
+    logger.info(f"✅ Found {len(filtered_entries)} articles matching keyword groups after enrichment")
+    return filtered_entries
 
 
 def check_keywords(title: str, summary: str, keyword_groups: Dict[str, List[str]]) -> List[str]:

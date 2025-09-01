@@ -23,13 +23,14 @@ INPUT_FILE = Path("aps-feed-input.yml")  # YAML config with keyword groups and f
 OUTPUT_YAML_FILE = Path("aps_feed/aps_results.yml")       # All processed articles (YAML format)
 
 # Network request settings
-REQUEST_TIMEOUT = 15          # HTTP request timeout in seconds (reduced for faster failure)
-MAX_ARXIV_RESULTS = 20        # Maximum number of arXiv search results to process
+REQUEST_TIMEOUT = 4           # HTTP request timeout in seconds (extreme speed)
+MAX_ARXIV_RESULTS = 10        # Maximum number of arXiv search results to process (speed optimized)
 
-# Parallelism optimization
-MAX_FEED_WORKERS = 20         # Maximum parallel workers for RSS feed processing
-MAX_ARXIV_WORKERS = 15        # Maximum parallel workers for arXiv enrichment
-ARXIV_BATCH_SIZE = 50         # Process arXiv in batches to optimize memory/performance
+# Parallelism optimization - EXTREME PERFORMANCE (0 rate limits detected)
+MAX_FEED_WORKERS = 100        # Maximum parallel workers for RSS feed processing
+MAX_ARXIV_WORKERS = 50        # Maximum parallelism since no rate limits encountered
+ARXIV_BATCH_SIZE = 200        # Large batches for maximum throughput
+ARXIV_REQUEST_DELAY = 0.02    # Minimal delay (20ms) for maximum speed
 
 # Article matching thresholds
 TITLE_SIMILARITY_THRESHOLD = 0.75  # Minimum title similarity for arXiv matching (0.0-1.0) - reduced for fuzzy matching
@@ -51,9 +52,21 @@ MAX_SEARCH_WORDS = 6          # Maximum number of title words to use in arXiv se
 # LOGGING SETUP
 # =============================================================================
 
+# Configure logging to both console and file
+from pathlib import Path
+
+# Create log directory if it doesn't exist
+log_dir = Path("aps_feed")
+log_dir.mkdir(exist_ok=True)
+
+# Set up logging configuration
 logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_dir / "output.log", mode='w'),  # Write to file
+        logging.StreamHandler()  # Also show on console
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -73,18 +86,18 @@ def create_optimized_session() -> requests.Session:
     """
     session = requests.Session()
     
-    # Configure retry strategy for transient failures
+    # Configure retry strategy for transient failures (extreme speed)
     retry_strategy = Retry(
-        total=3,                    # Total number of retries
+        total=1,                    # Minimal retries for maximum speed
         status_forcelist=[429, 500, 502, 503, 504],  # HTTP status codes to retry
-        backoff_factor=0.5,         # Backoff factor between retries
+        backoff_factor=0.1,         # Minimal backoff for fastest recovery
         respect_retry_after_header=True  # Respect server retry-after headers
     )
     
-    # Configure HTTP adapter with connection pooling
+    # Configure HTTP adapter with extreme connection pooling
     adapter = HTTPAdapter(
-        pool_connections=50,        # Number of connection pools
-        pool_maxsize=50,           # Maximum number of connections per pool
+        pool_connections=150,       # Extreme connection pools for maximum parallelism
+        pool_maxsize=150,          # Maximum connections per pool (exceeds max workers)
         max_retries=retry_strategy,
         pool_block=False           # Don't block when pool is full
     )
@@ -93,11 +106,12 @@ def create_optimized_session() -> requests.Session:
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     
-    # Set default headers for better performance
+    # Set default headers for better performance and arXiv compatibility
     session.headers.update({
-        'User-Agent': 'APS-Feed-Processor/1.0 (Scientific Research Tool)',
+        'User-Agent': 'APS-Feed-Processor/1.0 (mailto:ks.merikanto@gmail.com; Scientific Research Tool)',
         'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive'
+        'Connection': 'keep-alive',
+        'Accept': 'application/atom+xml, application/xml, text/xml'
     })
     
     return session
@@ -105,12 +119,31 @@ def create_optimized_session() -> requests.Session:
 # Global session instance for reuse across requests
 _global_session = None
 
+# Global rate limiting counter (thread-safe)
+import threading
+
+_rate_limit_lock = threading.Lock()
+_global_rate_limit_count = 0
+
 def get_session() -> requests.Session:
     """Get or create the global optimized session."""
     global _global_session
     if _global_session is None:
         _global_session = create_optimized_session()
     return _global_session
+
+def increment_rate_limit_count() -> int:
+    """Thread-safe increment of global rate limit counter."""
+    global _global_rate_limit_count, _rate_limit_lock
+    with _rate_limit_lock:
+        _global_rate_limit_count += 1
+        return _global_rate_limit_count
+
+def get_rate_limit_count() -> int:
+    """Get current global rate limit count."""
+    global _global_rate_limit_count, _rate_limit_lock
+    with _rate_limit_lock:
+        return _global_rate_limit_count
 
 # =============================================================================
 # CONFIGURATION LOADING

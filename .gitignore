@@ -3,3 +3,4 @@
 aps*.md
 *__pycache*
 *DS_STORE*
+*.log

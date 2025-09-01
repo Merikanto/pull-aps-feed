@@ -11,10 +11,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from .config import MAX_FEED_WORKERS, OUTPUT_YAML_FILE, load_config
+from .config import (MAX_FEED_WORKERS, OUTPUT_YAML_FILE, get_rate_limit_count,
+                     load_config)
 from .output import write_markdown_file, write_yaml_file
 from .processors import enrich_with_arxiv, process_single_feed
-from .utils import remove_duplicates_by_title
+from .utils import apply_keyword_filtering, remove_duplicates_by_title
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -61,9 +62,9 @@ def main() -> None:
         logger.info(f"⚡ Using {max_workers} parallel workers for feed processing")
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all feed processing tasks simultaneously
+            # Submit all feed processing tasks simultaneously (WITHOUT keyword filtering)
             future_to_feed = {
-                executor.submit(process_single_feed, feed, keyword_groups): feed
+                executor.submit(process_single_feed, feed, {}): feed  # Empty keyword_groups to skip filtering
                 for feed in feeds
             }
             
@@ -112,14 +113,18 @@ def main() -> None:
         arxiv_time = time.time() - arxiv_start_time
         logger.info(f"✅ arXiv enrichment completed in {arxiv_time:.2f}s")
         
-        # Filter entries that matched keyword groups for markdown output
-        # Special case: if keyword filtering is disabled, include all entries
+        # Apply keyword filtering to enriched articles (with richer arXiv summaries)
+        logger.info(f"🎯 Applying keyword filtering to {len(enriched_entries)} enriched articles...")
+        filtering_start_time = time.time()
+        
         if not keyword_groups:
             filtered_entries = enriched_entries
             logger.info(f"📋 No keyword filtering - including all {len(filtered_entries)} articles")
         else:
-            filtered_entries = [entry for entry in enriched_entries if entry.keywords]
-            logger.info(f"🎯 Filtered to {len(filtered_entries)} articles with keyword group matches")
+            filtered_entries = apply_keyword_filtering(enriched_entries, keyword_groups)
+            filtering_time = time.time() - filtering_start_time
+            logger.info(f"✅ Keyword filtering completed in {filtering_time:.2f}s")
+            logger.info(f"🎯 Found {len(filtered_entries)} articles matching keyword groups (vs {len(entries)} before enrichment)")
         
         # Remove duplicate articles based on title similarity before final output
         logger.info("🔍 Removing duplicate articles from filtered results...")
@@ -136,6 +141,9 @@ def main() -> None:
         final_articles = len(deduplicated_entries)
         duplicates_removed = keyword_matches - final_articles
         
+        # Get total rate limiting events from global counter
+        total_rate_limits = get_rate_limit_count()
+        
         # Log completion and display comprehensive results summary
         logger.info("🎉 Processing completed successfully!")
         
@@ -146,7 +154,6 @@ def main() -> None:
         print(f"📄 Output files:")
         print(f"  • YAML: {OUTPUT_YAML_FILE} ({len(enriched_entries)} articles)")
         print(f"  • Markdown: {OUTPUT_MARKDOWN_FILE} ({final_articles} articles after deduplication)")
-        print(f"🎉🎉 Found {arxiv_matches} arXiv matches out of {len(enriched_entries)} articles")
         
         # Format keyword groups for user-friendly display
         if keyword_groups:
@@ -162,12 +169,23 @@ def main() -> None:
         if duplicates_removed > 0:
             print(f"🧹 Removed {duplicates_removed} duplicate articles from markdown output")
         
+        # Display rate limiting statistics
+        if total_rate_limits > 0:
+            print(f"🚨 arXiv API Rate Limiting: {total_rate_limits} events encountered")
+            logger.warning(f"🚨 Total arXiv rate limiting events: {total_rate_limits}")
+        else:
+            print(f"✅ No arXiv rate limiting encountered")
+        
         # Display performance metrics
         total_time = time.time() - start_time
         print(f"\n⏱️  Performance Summary:")
         print(f"  • Total execution time: {total_time:.2f}s")
         print(f"  • Feed processing: {feed_time:.2f}s ({len(feeds)} feeds in parallel)")
         print(f"  • arXiv enrichment: {arxiv_time:.2f}s ({len(entries)} articles in parallel)")
+        if keyword_groups and 'filtering_time' in locals():
+            print(f"  • Keyword filtering: {filtering_time:.2f}s (applied to enriched content)")
+        if total_rate_limits > 0:
+            print(f"  • Rate limiting events: {total_rate_limits} (check logs for details)")
         print(f"{'='*60}")
     
     except Exception as e:

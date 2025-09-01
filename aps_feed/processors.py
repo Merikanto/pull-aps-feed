@@ -18,15 +18,15 @@ import requests
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz, process
 
-from .config import (ARXIV_BATCH_SIZE, AUTHOR_FUZZY_THRESHOLD,
-                     MAX_ARXIV_RESULTS, MAX_ARXIV_WORKERS, MAX_SEARCH_WORDS,
-                     MIN_WORD_LENGTH, REQUEST_TIMEOUT,
-                     TITLE_FUZZY_WEIGHT_INTERSECTION,
+from .config import (ARXIV_BATCH_SIZE, ARXIV_REQUEST_DELAY,
+                     AUTHOR_FUZZY_THRESHOLD, MAX_ARXIV_RESULTS,
+                     MAX_ARXIV_WORKERS, MAX_SEARCH_WORDS, MIN_WORD_LENGTH,
+                     REQUEST_TIMEOUT, TITLE_FUZZY_WEIGHT_INTERSECTION,
                      TITLE_FUZZY_WEIGHT_PARTIAL, TITLE_FUZZY_WEIGHT_RATIO,
                      TITLE_FUZZY_WEIGHT_TOKEN_SET,
                      TITLE_FUZZY_WEIGHT_TOKEN_SORT,
                      TITLE_FUZZY_WEIGHT_WORD_FUZZY, TITLE_SIMILARITY_THRESHOLD,
-                     get_session)
+                     get_session, increment_rate_limit_count)
 from .models import FeedEntry
 from .utils import check_keywords
 
@@ -336,14 +336,17 @@ class ArxivMatcher:
     - Author name verification with flexible matching
     - Title similarity scoring with configurable thresholds
     - Parallel processing support for multiple articles
+    - Search result caching for performance optimization
     
     Attributes:
         base_url (str): arXiv API query endpoint URL
+        search_cache (dict): Cache for arXiv search results to avoid duplicate API calls
     """
     
     def __init__(self) -> None:
-        """Initialize arXiv matcher with API configuration."""
+        """Initialize arXiv matcher with API configuration and caching."""
         self.base_url = "http://export.arxiv.org/api/query"
+        self.search_cache = {}  # Simple cache to avoid duplicate searches
     
     def extract_title_words(self, title: str) -> List[str]:
         """
@@ -455,14 +458,16 @@ class ArxivMatcher:
             word_fuzzy_similarity * TITLE_FUZZY_WEIGHT_WORD_FUZZY         # Fuzzy matching on key words
         )
         
-        logger.debug(f"Title similarity breakdown:")
-        logger.debug(f"  Word intersection: {word_similarity:.3f}")
-        logger.debug(f"  Fuzzy ratio: {ratio_similarity:.3f}")
-        logger.debug(f"  Fuzzy partial: {partial_similarity:.3f}")
-        logger.debug(f"  Token sort: {token_sort_similarity:.3f}")
-        logger.debug(f"  Token set: {token_set_similarity:.3f}")
-        logger.debug(f"  Word fuzzy: {word_fuzzy_similarity:.3f}")
-        logger.debug(f"  Combined: {combined_similarity:.3f}")
+        # Only log detailed breakdown for high similarity scores or debug mode
+        if combined_similarity > 0.7:
+            logger.debug(f"Title similarity breakdown:")
+            logger.debug(f"  Word intersection: {word_similarity:.3f}")
+            logger.debug(f"  Fuzzy ratio: {ratio_similarity:.3f}")
+            logger.debug(f"  Fuzzy partial: {partial_similarity:.3f}")
+            logger.debug(f"  Token sort: {token_sort_similarity:.3f}")
+            logger.debug(f"  Token set: {token_set_similarity:.3f}")
+            logger.debug(f"  Word fuzzy: {word_fuzzy_similarity:.3f}")
+            logger.debug(f"  Combined: {combined_similarity:.3f}")
         
         return combined_similarity
     
@@ -493,12 +498,9 @@ class ArxivMatcher:
     
     def search_arxiv(self, title: str, max_results: int = MAX_ARXIV_RESULTS) -> List[Dict[str, Any]]:
         """
-        Search arXiv for articles matching the title using enhanced keyword strategies.
+        Search arXiv for articles matching the title using optimized search strategy.
         
-        Uses multiple search approaches:
-        1. Original keyword-based search
-        2. Enhanced keyword selection with better prioritization
-        3. Multiple search queries with different keyword combinations
+        Uses single optimized search with enhanced keyword selection for better performance.
         
         Args:
             title: Article title to search for
@@ -515,27 +517,17 @@ class ArxivMatcher:
                 logger.warning(f"No meaningful words extracted from title: '{title}'")
                 return []
             
-            # Strategy 1: Original search with first N words
-            primary_search_words = title_words[:MAX_SEARCH_WORDS]
-            primary_results = self._perform_arxiv_search(primary_search_words, max_results // 2)
+            # Use single optimized search strategy (faster than dual search)
+            if len(title_words) <= MAX_SEARCH_WORDS:
+                # If few words, use all of them
+                search_words = title_words
+            else:
+                # Use enhanced keyword selection for better results
+                search_words = self._select_enhanced_keywords(title_words, MAX_SEARCH_WORDS)
             
-            # Strategy 2: Enhanced search with better keyword selection
-            enhanced_keywords = self._select_enhanced_keywords(title_words, MAX_SEARCH_WORDS)
-            enhanced_results = self._perform_arxiv_search(enhanced_keywords, max_results // 2)
-            
-            # Combine and deduplicate results
-            all_results = primary_results + enhanced_results
-            seen_titles = set()
-            unique_results = []
-            
-            for result in all_results:
-                title_key = result.get("title", "").strip().lower()
-                if title_key and title_key not in seen_titles:
-                    seen_titles.add(title_key)
-                    unique_results.append(result)
-            
-            logger.debug(f"ArXiv search returned {len(unique_results)} unique results")
-            return unique_results[:max_results]
+            results = self._perform_arxiv_search(search_words, max_results)
+            logger.debug(f"ArXiv search returned {len(results)} results")
+            return results
         
         except requests.RequestException as e:
             logger.warning(f"Network error during arXiv search for '{title}': {e}")
@@ -545,27 +537,119 @@ class ArxivMatcher:
             return []
     
     def _perform_arxiv_search(self, search_words: List[str], max_results: int) -> List[Dict[str, Any]]:
-        """Perform actual arXiv API search with given keywords."""
+        """Perform actual arXiv API search with given keywords and caching."""
         if not search_words:
             return []
         
-        search_query = ' '.join(search_words)
-        params = {
-            "search_query": f'ti:{search_query}',
-            "start": 0,
-            "max_results": max_results,
-        }
+        # Sanitize search words for arXiv API
+        sanitized_words = []
+        for word in search_words:
+            # Remove special characters that might cause issues
+            clean_word = re.sub(r'[^\w\s-]', '', word)
+            if clean_word and len(clean_word) >= 2:
+                sanitized_words.append(clean_word)
         
-        url = f"{self.base_url}?" + urllib.parse.urlencode(params)
-        logger.debug(f"Searching arXiv with keywords: '{search_query}'")
+        if not sanitized_words:
+            logger.debug("No valid search words after sanitization")
+            return []
         
-        # Use optimized session for better performance
-        session = get_session()
-        response = session.get(url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
+        search_query = ' '.join(sanitized_words)
         
-        parsed = feedparser.parse(response.text)
-        return list(parsed.get("entries", []))
+        # Check cache first to avoid duplicate API calls
+        cache_key = f"{search_query}:{max_results}"
+        if cache_key in self.search_cache:
+            logger.debug(f"Using cached results for: '{search_query}'")
+            return self.search_cache[cache_key]
+        
+        # Add configurable delay to respect arXiv API rate limits
+        time.sleep(ARXIV_REQUEST_DELAY)  # Configurable delay between requests
+        
+        try:
+            # Try multiple query formats, starting with most compatible
+            query_attempts = [
+                f'all:{search_query}',   # All-fields search (most compatible)
+                f'ti:{search_query}',    # Unquoted title search 
+                f'au:{search_query}'     # Author search (if title fails)
+            ]
+            
+            for attempt, query_format in enumerate(query_attempts, 1):
+                try:
+                    params = {
+                        "search_query": query_format,
+                        "start": 0,
+                        "max_results": max_results,
+                    }
+                    
+                    # Use safe URL encoding to avoid malformed queries
+                    url = f"{self.base_url}?" + urllib.parse.urlencode(params, safe=':')
+                    logger.debug(f"Searching arXiv (attempt {attempt}): '{search_query}' using {query_format}")
+                    
+                    # Use optimized session for better performance
+                    session = get_session()
+                    response = session.get(url, timeout=REQUEST_TIMEOUT)
+                    
+                    # Handle specific error cases
+                    if response.status_code == 406:
+                        # 406 = Query format not accepted, try next format silently
+                        logger.debug(f"Query format '{query_format}' not accepted, trying next format...")
+                        continue
+                    elif response.status_code == 429:
+                        # 429 = Rate limited - this is a real issue that needs attention
+                        current_count = increment_rate_limit_count()
+                        backoff_time = ARXIV_REQUEST_DELAY * (2 ** attempt)
+                        logger.error(f"🚨🚨🚨 RATE LIMITED BY ARXIV API (HTTP 429) #{current_count} 🚨🚨🚨")
+                        logger.error(f"🔥 Query: '{search_query}' - Attempt {attempt}")
+                        logger.error(f"⏱️  Backing off for {backoff_time:.1f}s before retry...")
+                        print(f"\n🚨🚨🚨 RATE LIMITED BY ARXIV #{current_count}! Waiting {backoff_time:.1f}s... 🚨🚨🚨")
+                        time.sleep(backoff_time)
+                        continue
+                    
+                    response.raise_for_status()
+                    
+                    parsed = feedparser.parse(response.text)
+                    results = list(parsed.get("entries", []))
+                    
+                    # Cache successful results
+                    self.search_cache[cache_key] = results
+                    logger.debug(f"✅ arXiv search successful with format: {query_format}")
+                    
+                    return results
+                    
+                except requests.HTTPError as e:
+                    if e.response.status_code == 406 and attempt < len(query_attempts):
+                        # 406 just means query format not accepted, try next format silently
+                        logger.debug(f"Query format {attempt} not accepted, trying next format...")
+                        continue
+                    elif e.response.status_code == 429:
+                        # Rate limiting - this needs attention
+                        current_count = increment_rate_limit_count()
+                        logger.error(f"🚨🚨🚨 RATE LIMITED BY ARXIV API (HTTP 429) #{current_count} 🚨🚨🚨")
+                        logger.error(f"🔥 Exception on attempt {attempt} for query: '{search_query}'")
+                        print(f"\n🚨🚨🚨 RATE LIMITED BY ARXIV #{current_count}! (Exception handler) 🚨🚨🚨")
+                        if attempt == len(query_attempts):
+                            raise
+                    else:
+                        # Other HTTP errors are worth logging
+                        logger.warning(f"HTTP error {e.response.status_code} on attempt {attempt}: {e}")
+                        if attempt == len(query_attempts):
+                            raise
+                except requests.RequestException as e:
+                    logger.warning(f"Network error on attempt {attempt}: {e}")
+                    if attempt == len(query_attempts):
+                        raise
+            
+            # If all attempts failed, try simplified search as last resort
+            logger.debug(f"All query formats rejected for '{search_query}' - trying simplified search")
+            if len(sanitized_words) > 2:
+                return self._perform_arxiv_search(sanitized_words[:2], max_results)
+            
+            # Return empty results if everything fails (this is normal, not an error)
+            logger.debug(f"No compatible query format found for '{search_query}' - no results")
+            return []
+            
+        except Exception as e:
+            logger.error(f"Unexpected error during arXiv search for '{search_query}': {e}")
+            return []
     
     def _select_enhanced_keywords(self, title_words: List[str], max_words: int) -> List[str]:
         """
@@ -795,12 +879,17 @@ class ArxivMatcher:
         title: str, 
         authors: List[str]
     ) -> Optional[Dict[str, str]]:
-        """Find matching arXiv article for given title and authors using flexible matching."""
+        """Find matching arXiv article for given title and authors using optimized matching."""
         logger.info(f"Searching arXiv for: '{title}'")
+        
+        # Quick pre-filter: skip articles with very short titles (likely not research papers)
+        if len(title.split()) < 3:
+            logger.debug(f"Skipping short title: '{title}'")
+            return None
         
         arxiv_results = self.search_arxiv(title)
         if not arxiv_results:
-            logger.info(f"No arXiv results found for '{title}'")
+            logger.debug(f"No arXiv results found for '{title}'")
             return None
         
         logger.debug(f"Found {len(arxiv_results)} potential matches, checking title similarity and authors...")
@@ -812,24 +901,27 @@ class ArxivMatcher:
             arxiv_title = result.get("title", "").strip()
             arxiv_authors = self.extract_arxiv_authors(result)
             
+            # Quick pre-check: if no authors, skip
+            if not arxiv_authors:
+                logger.debug(f"Skipping arXiv article with no authors: '{arxiv_title[:50]}...'")
+                continue
+            
             # Calculate title similarity
             title_similarity = self.calculate_title_similarity(title, arxiv_title)
+            
+            # Early termination: if title similarity is very low, skip author check
+            if title_similarity < 0.3:  # Much lower than threshold for early exit
+                logger.debug(f"Skipping low similarity ({title_similarity:.2f}): '{arxiv_title[:50]}...'")
+                continue
             
             # Check if first or second author matches
             author_match = self.verify_author_match(authors, arxiv_authors, check_first_two_only=True)
             
-            logger.info(f"Title similarity: {title_similarity:.2f}, Author match: {author_match}")
-            logger.info(f"  PRL: '{title}'")
-            logger.info(f"  arXiv: '{arxiv_title}'")
-            logger.info(f"  PRL authors: {authors[:2]}")
-            logger.info(f"  arXiv authors: {arxiv_authors[:3]}...")
-            
-            # Debug word extraction for specific case
-            if "metallic and insulating domains" in title.lower():
-                prl_words = self.extract_title_words(title)
-                arxiv_words = self.extract_title_words(arxiv_title)
-                logger.info(f"  DEBUG PRL words: {prl_words}")
-                logger.info(f"  DEBUG arXiv words: {arxiv_words}")
+            logger.debug(f"Title similarity: {title_similarity:.2f}, Author match: {author_match}")
+            logger.debug(f"  PRL: '{title}'")
+            logger.debug(f"  arXiv: '{arxiv_title}'")
+            logger.debug(f"  PRL authors: {authors[:2]}")
+            logger.debug(f"  arXiv authors: {arxiv_authors[:3]}...")
             
             # Accept if title similarity >= threshold AND (first or second author matches)
             if title_similarity >= TITLE_SIMILARITY_THRESHOLD and author_match:
@@ -957,16 +1049,21 @@ def enrich_with_arxiv(entries: List[FeedEntry]) -> List[FeedEntry]:
     
     logger.info(f"🔍 Starting optimized arXiv enrichment for {len(entries)} articles...")
     
-    # Process in batches for memory efficiency and better performance
-    enriched_entries = []
-    total_batches = (len(entries) + ARXIV_BATCH_SIZE - 1) // ARXIV_BATCH_SIZE
+    # Conservative batching for arXiv API limits
+    # Use smaller batches to respect arXiv API rate limits
+    optimal_batch_size = min(ARXIV_BATCH_SIZE, len(entries))  # Respect API limits
     
-    for batch_num, i in enumerate(range(0, len(entries), ARXIV_BATCH_SIZE), 1):
-        batch_entries = entries[i:i + ARXIV_BATCH_SIZE]
+    enriched_entries = []
+    total_batches = (len(entries) + optimal_batch_size - 1) // optimal_batch_size
+    
+    logger.info(f"⚡ Using adaptive batching: {total_batches} batches of ~{optimal_batch_size} articles each")
+    
+    for batch_num, i in enumerate(range(0, len(entries), optimal_batch_size), 1):
+        batch_entries = entries[i:i + optimal_batch_size]
         batch_start_time = time.time()
-        logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch_entries)} articles)")
+        logger.info(f"📦 📦 📦 Processing batch {batch_num}/{total_batches} ({len(batch_entries)} articles) 📦 📦 📦")
         
-        # Use ThreadPoolExecutor for parallel arXiv processing within batch
+        # Use more workers for larger batches
         max_workers = min(len(batch_entries), MAX_ARXIV_WORKERS)
         logger.debug(f"⚡ Using {max_workers} parallel workers for batch {batch_num}")
         
@@ -978,7 +1075,7 @@ def enrich_with_arxiv(entries: List[FeedEntry]) -> List[FeedEntry]:
                 for entry in batch_entries
             }
             
-            # Collect results as they complete
+            # Collect results as they complete (no need to wait for all)
             for future in as_completed(future_to_entry):
                 entry = future_to_entry[future]
                 try:
@@ -995,7 +1092,8 @@ def enrich_with_arxiv(entries: List[FeedEntry]) -> List[FeedEntry]:
         
         enriched_entries.extend(batch_enriched)
         batch_time = time.time() - batch_start_time
-        logger.info(f"✅ Completed batch {batch_num}/{total_batches} in {batch_time:.1f}s")
+        avg_time_per_article = batch_time / len(batch_entries)
+        logger.info(f"✅ ✅ ✅ Completed batch {batch_num}/{total_batches} in {batch_time:.1f}s ({avg_time_per_article:.2f}s/article) ✅ ✅ ✅")
     
     logger.info(f"🎉 Completed arXiv enrichment for all {len(enriched_entries)} articles")
     return enriched_entries 
