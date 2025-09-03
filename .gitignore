@@ -1,6 +1,0 @@
-.vscode
-*aps_results.yml
-aps*.md
-*__pycache*
-*DS_STORE*
-*.log
